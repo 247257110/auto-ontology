@@ -334,6 +334,14 @@ def fetch_table_by_name(name: str) -> dict[str, Any] | None:
     Ambiguous by construction: a name is not unique across schemas or
     databases. Ordered by id so repeated calls agree with each other — which row
     wins is still arbitrary, but it is the same arbitrary row each time.
+
+    Callers that know which database they mean must use
+    :func:`fetch_table_in_database` instead. Resolving ``invoices`` here against
+    a deployment where both ``wideworldimporters.sales`` and a second database
+    carry an ``invoices`` table returns whichever was ingested first, and the
+    caller then runs that schema-qualified name on the *other* database's
+    connection: an ``UndefinedTable`` that names a table the user never asked
+    about.
     """
     rows = store().query_read(
         _table_select()
@@ -342,6 +350,58 @@ def fetch_table_by_name(name: str) -> dict[str, Any] | None:
         .limit(1)
     )
     return _table_row(rows[0]) if rows else None
+
+
+def fetch_table_in_database(
+    name: str, database_name: str
+) -> dict[str, Any] | None:
+    """The table of that name *inside one database*, with its database name.
+
+    Same rationale as :func:`find_table_id_by_name`: a bare name is ambiguous
+    once more than one database is connected, so the lookup is scoped, and the
+    returned row carries ``database_name`` so the caller can route the read to
+    the right connector instead of falling back to the first one configured.
+
+    Returns ``None`` when the database has no table of that name — the caller
+    should skip it, not substitute a same-named table from elsewhere.
+    """
+    if not name or not database_name:
+        return None
+    rows = store().query_read(
+        select(
+            s.catalog_table.c.id,
+            s.catalog_table.c.name,
+            s.catalog_schema.c.name.label("schema_name"),
+            s.catalog_database.c.name.label("database_name"),
+            s.catalog_table.c.description,
+            s.catalog_table.c.pk,
+        )
+        .select_from(
+            s.catalog_table.join(
+                s.catalog_schema, s.catalog_table.c.schema_id == s.catalog_schema.c.id
+            ).join(
+                s.catalog_database,
+                s.catalog_database.c.id == s.catalog_schema.c.database_id,
+            )
+        )
+        .where(
+            func.lower(s.catalog_table.c.name) == name.lower(),
+            s.catalog_database.c.name == database_name,
+        )
+        .order_by(s.catalog_table.c.id)
+        .limit(1)
+    )
+    if not rows:
+        return None
+    row = rows[0]
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "schema_name": row["schema_name"],
+        "database_name": row["database_name"],
+        "description": row["description"],
+        "pk": row["pk"],
+    }
 
 
 def fetch_join_neighbors(table_id: str) -> list[dict[str, Any]]:

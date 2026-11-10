@@ -8,6 +8,16 @@ from typing import List, Annotated, Literal
 
 # ==================== TYPE ALIASES ====================
 
+# Appended to every ``reasoning`` / ``thought`` description. Those strings are
+# surfaced verbatim as the "thinking" line under each step in the chat UI
+# (``record_thought`` -> the ``step`` event's ``thought``), and the whole
+# pipeline prompts in English, so without this the model reasons in English
+# while the UI is Chinese. Only user-facing prose gets it — ``sql_code``,
+# identifiers and the values returned by the database never get translated;
+# the final ``response`` is asked for Chinese in its own description, because
+# it also has to be told to leave those identifiers alone.
+_THINK_IN_CHINESE = " Write this in Simplified Chinese (简体中文)."
+
 NonEmptyStr = Annotated[str, Field(min_length=1, description="Non-empty string")]
 
 NonEmptyStrList = Annotated[
@@ -103,7 +113,8 @@ class TableRelevanceModel(BaseModel):
 
     reasoning: str = Field(
         ...,
-        description="Brief reasoning (1-2 sentences max) on which tables are relevant.",
+        description="Brief reasoning (1-2 sentences max) on which tables are relevant."
+        + _THINK_IN_CHINESE,
     )
     tables_to_remove: list[TableRemovalModel] = Field(
         default_factory=list,
@@ -121,7 +132,8 @@ class CustomAnalysisRelevanceModel(BaseModel):
 
     reasoning: str = Field(
         ...,
-        description="Brief reasoning (1-2 sentences max) on which custom analyses are relevant.",
+        description="Brief reasoning (1-2 sentences max) on which custom analyses are relevant."
+        + _THINK_IN_CHINESE,
     )
     analyses_to_remove: list[str] = Field(
         ...,
@@ -144,7 +156,10 @@ class CandidateFilterModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    reasoning: str = Field(..., description="Brief reasoning (1-2 sentences max).")
+    reasoning: str = Field(
+        ...,
+        description="Brief reasoning (1-2 sentences max)." + _THINK_IN_CHINESE,
+    )
     best_id: str | None = Field(
         ...,
         description="ID of the single best candidate that matches the user's intent. Null if none match.",
@@ -182,7 +197,10 @@ class AnchorColumnModel(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    reasoning: str = Field(..., description="Brief reasoning (1-2 sentences max).")
+    reasoning: str = Field(
+        ...,
+        description="Brief reasoning (1-2 sentences max)." + _THINK_IN_CHINESE,
+    )
     anchor_id: str | None = Field(
         ...,
         description="The id of the ColumnAttribute that is the primary focus of the question.",
@@ -233,7 +251,7 @@ class SQLGenerationModel(StrictModel):
             "or NULL groups are included, excluded, or coerced to 0, and how any "
             "division guards against a zero denominator; (3) ties — what breaks a "
             "tie in a ranking/superlative query. If none were needed, state that "
-            "explicitly."
+            "explicitly." + _THINK_IN_CHINESE
         ),
     )
     sql_code: NonEmptyStr = Field(
@@ -245,13 +263,15 @@ class SQLGenerationModel(StrictModel):
     response: NonEmptyStr = Field(
         ...,
         description=(
-            "User-facing summary in plain English (2-4 sentences): describe what "
+            "User-facing summary in Simplified Chinese (2-4 sentences): describe what "
             "is being calculated, which tables and columns are used, any filters "
             "or time windows applied, and the grouping/ordering. Refer to tables "
             "and columns by their human-readable names. "
             "Do NOT include SQL and code fences "
             "identifiers like 'schema.table', reasoning, self-corrections, "
-            "formatting notes, or internal thoughts."
+            "formatting notes, or internal thoughts. Keep table names, column "
+            "names and any value quoted from the data in their original form — "
+            "do not translate them."
         ),
     )
 

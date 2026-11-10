@@ -291,13 +291,13 @@ def _install_sql_correction(
     record_thought(
         path_state,
         _GRAPH_NODE_NAME,
-        "Rewriting the query so the submitted statement matches what should run.",
+        "重写查询，使最终提交的语句与实际要执行的语句一致。",
     )
     thought = (getattr(previous, "thought", "") or "").strip() or (
-        "The query is unchanged apart from the correction required to run it."
+        "除为让查询可执行而做的修正外，查询本身没有变化。"
     )
     summary = (getattr(previous, "response", "") or "").strip() or (
-        "The query was adjusted so its results come back in the expected form."
+        "查询已调整，使结果按预期的形式返回。"
     )
     response = SQLGenerationModel(thought=thought, sql_code=corrected, response=summary)
     return {
@@ -354,7 +354,11 @@ class ErrorAnalysis(BaseModel):
     )
     explanation: str = Field(
         default="",
-        description="Brief explanation of the diagnosis.",
+        description=(
+            "Brief explanation of the diagnosis. Write this in Simplified Chinese "
+            "(简体中文): it is shown verbatim as the thinking line in a Chinese "
+            "chat UI."
+        ),
     )
 
 
@@ -378,7 +382,11 @@ the missing concepts in our ontology database (focus on entity names and \
 relationships, NOT SQL syntax).
 - fixable: the SQL can be corrected using the SAME tables (syntax error, \
 wrong column reference, wrong aggregation, bad logic, etc.). Leave \
-search_queries empty."""
+search_queries empty.
+
+Write the explanation field in Simplified Chinese (简体中文): it is shown verbatim \
+as the thinking line in a Chinese chat UI. Keep SQL, identifiers and driver \
+error text exactly as they are."""
 
 
 # ------------------------------------------------------------------
@@ -762,6 +770,9 @@ class SQLReconstructionAgent(BaseAgent):
             f"{known_columns_section}"
             f"The user's question was:\n{question_block}\n"
             "You must include corrected sql in your final answer.\n"
+            "Write the `thought` field in Simplified Chinese (简体中文) — it is "
+            "shown verbatim as the thinking line in a Chinese chat UI. Keep SQL, "
+            "identifiers and driver error text exactly as they are.\n"
             "Follow the rules defined in the previous messages for "
             "writing the final answer."
         )

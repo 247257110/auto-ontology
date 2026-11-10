@@ -1363,9 +1363,8 @@ def _stale_anchor_note(anchor: Any, *, now: Any = None) -> str | None:
     if behind <= _STALE_ANCHOR_DAYS:
         return None
     return (
-        f"This prediction is anchored at {anchored.date()}, {behind:,} days ago, "
-        f"because that is as far as the data reaches. It is a forecast from that "
-        f"date, not from today."
+        f"这次预测锚定在 {anchored.date()}，也就是 {behind:,} 天前 —— "
+        f"因为数据只到这里。它是以那一天为起点做的预测，不是从今天起算的。"
     )
 
 
@@ -1438,6 +1437,14 @@ _GENERIC_ENTITY_FILTER_RE = re.compile(
 )
 _GENERIC_ENTITY_TYPE_COLUMNS = {"customer_type", "account_type", "entity_type", "type"}
 
+# ``PREDICT <target> [RANK TOP k] FOR EACH ...`` — the target ends where RANK or
+# FOR EACH begins, and it may wrap onto the next line.
+_RANK_TOP_RE = re.compile(r"[ \t]*\bRANK\s+TOP\s+\d+[ \t]*\n?", re.IGNORECASE)
+_PREDICT_TARGET_RE = re.compile(
+    r"\bPREDICT\s+(?P<target>.+?)(?=\s+(?:RANK|FOR)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def _strip_unasked_generic_entity_filter(pql: str, question: str) -> str:
     """Remove inferred entity-type filters when the user asked for the whole population.
@@ -1462,6 +1469,65 @@ def _strip_unasked_generic_entity_filter(pql: str, question: str) -> str:
         + match.group("tail")
         + pql[match.end() :]
     )
+
+
+def drop_unrankable_top_k(
+    pql: str, col_stypes: dict[str, dict[str, str]] | None = None
+) -> str:
+    """Remove ``RANK TOP k`` from a target that cannot be ranked.
+
+    The prompt tells the model repeatedly that ``RANK TOP`` belongs to link
+    prediction and multi-class targets only, and it still appends it whenever the
+    question says "top 20" — then the backend refuses the whole prediction with
+    *"RANK TOP only applies to a link prediction (LIST_DISTINCT) or a multi-class
+    column target"*. That refusal arrives after the graph is built, so the user
+    pays the expensive part and gets nothing.
+
+    The request "top 20" is a presentation concern: a prediction scores every
+    entity, and the formatter orders by that score anyway. So dropping the clause
+    loses no information — it turns a hard failure into the answer the user asked
+    for. Removing it here is deterministic, which the prompt is not.
+
+    A bare column target is kept: it *may* be multi-categorical, and ranking those
+    is legitimate. Only an aggregate or a comparison (``COUNT(...) = 0``) is
+    unambiguously rank-free.
+    """
+    match = _RANK_TOP_RE.search(pql)
+    if not match:
+        return pql
+
+    # Match against the whole statement: the target ends at the RANK/FOR lookahead,
+    # which by definition is not inside the part before it.
+    target = _PREDICT_TARGET_RE.search(pql)
+    if target is None:
+        return pql
+    expression = target.group("target").strip()
+    upper = expression.upper()
+    if "LIST_DISTINCT" in upper:
+        return pql
+
+    unrankable = "(" in expression or "=" in expression
+    if not unrankable and col_stypes:
+        column = expression.rsplit(".", 1)[-1].strip('" ')
+        for table_columns in col_stypes.values():
+            stype = str(table_columns.get(column, "")).upper()
+            if stype:
+                unrankable = not any(
+                    marker in stype for marker in ("CATEGOR", "MULTI")
+                )
+                break
+    if not unrankable:
+        return pql
+
+    logger.info("PQL: dropped RANK TOP from a target it cannot rank: %s", expression)
+    before, after = pql[: match.start()], pql[match.end() :]
+    # The pattern eats the whitespace on *both* sides of the clause, so joining the
+    # halves blindly welds the neighbours together: ``= 0 RANK TOP 20 FOR EACH``
+    # becomes ``= 0FOR EACH`` and the backend answers "No FOR EACH found" — a
+    # failure this function was supposed to prevent. Keep exactly one separator.
+    if before and after and not before[-1].isspace() and not after[0].isspace():
+        before += " "
+    return before + after
 
 
 def predict_all(
@@ -1611,6 +1677,9 @@ def generate_pql(
             schema_text="\n".join([graph_ddl, column_reference, *docs]),
         )
         pql = _strip_unasked_generic_entity_filter(pql, question)
+        # "top 20" in a question makes the model bolt RANK TOP onto a binary
+        # target, which the backend refuses only after the graph is built.
+        pql = drop_unrankable_top_k(pql, graph_col_stypes)
         entity_sql = extract_entity_sql(raw)
         if explain and explain_entity:
             pql = _scope_explain_entity(pql, explain_entity)
@@ -1687,9 +1756,9 @@ def generate_pql(
                     scope_sql = None
                     if re.search(r"\b(WHERE|LIMIT)\b", entity_sql, re.IGNORECASE):
                         result.note = (
-                            "A grouped breakdown scores every entity and aggregates by "
-                            f"'{group_by}', so the planner's entity filter was not applied — these totals "
-                            "cover the whole population. Ask without grouping to filter a sub-population."
+                            "按组分组的明细会对每个实体打分后按 "
+                            f"'{group_by}' 汇总，因此查询里设置的实体筛选条件没有生效 —— "
+                            "这些合计覆盖的是全量。若只想看某个子集，请去掉分组再问。"
                         )
                     result.entity_sql = None
                 indices, population = _resolve_indices(
@@ -1709,15 +1778,14 @@ def generate_pql(
                         parsed = parse_entity(pql)
                         entity_table = parsed[0] if parsed else "entity"
                         result.note = (
-                            f"LIMITATION: KumoRFM forecasts a multi-period time series for ONE {entity_table} at "
-                            f"a time, so a month-by-month forecast for ALL {entity_table}s in one run is not "
-                            f"supported. It supports EITHER (a) a multi-horizon forecast for a single "
-                            f"{entity_table}, OR (b) a single-horizon prediction across all {entity_table}s. "
-                            f"{len(indices)} {entity_table}s matched; shown below is the multi-period forecast "
-                            f"for just one ({indices[0]}). To cover the whole population, run a single-horizon "
-                            f"prediction across all {entity_table}s first, then a multi-horizon forecast for the "
-                            f"few {entity_table}s of interest (one at a time). Tell the user both options and ask "
-                            f"which they want — do NOT imply the all-entity month-by-month result was produced."
+                            f"限制：KumoRFM 一次只能对单个 {entity_table} 做多期时间序列预测，"
+                            f"所以无法在一次运行里给出全部 {entity_table} 的逐月预测。"
+                            f"它支持的两种方式是：(a) 对单个 {entity_table} 做多跨度预测，"
+                            f"或 (b) 对全部 {entity_table} 做单跨度预测。"
+                            f"本次匹配到 {len(indices)} 个 {entity_table}，下面只展示其中一个"
+                            f"（{indices[0]}）的多期预测。"
+                            f"如需覆盖全量，可以先对全部 {entity_table} 做单跨度预测，"
+                            f"再对关注的少数 {entity_table} 逐个做多期预测。"
                         )
                     indices = indices[:1]
 

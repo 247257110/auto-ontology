@@ -390,7 +390,7 @@ class SQLFromCandidatesAgent(BaseAgent):
             return {
                 "path_state": {
                     **path_state,
-                    "unconstructable_explanation": "LLM failed to produce a response.",
+                    "unconstructable_explanation": "模型没有产出可用的回答。",
                 },
                 "decision": "unconstructable",
             }

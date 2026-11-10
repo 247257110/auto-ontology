@@ -283,7 +283,7 @@ export const useChat = () => {
 
 					setSteps((prev) => [
 						...prev.map((s) => ({ ...s, status: 'completed' as const })),
-						{ node: 'visualize', label: 'Building charts', status: 'active' as const },
+						{ node: 'visualize', label: '正在生成图表', status: 'active' as const },
 					]);
 				},
 
@@ -450,7 +450,7 @@ export const useChat = () => {
 							...prev.map((s) => ({ ...s, status: 'completed' as const })),
 							{
 								node: 'visualize',
-								label: 'Building charts',
+								label: '正在生成图表',
 								status: 'active' as const,
 							},
 						]);

@@ -64,8 +64,15 @@ COPY pyproject.toml uv.lock .python-version ./
 COPY vendor/ vendor/
 
 # Resolve and install the dependency closure into /opt/venv.
+#
+# ``--extra kumo`` pulls the vendored ``kumo-relational-client`` wheel set
+# (see vendor/wheels). It is needed only by the self-hosted NIM backend
+# (KUMO_RFM_API_URL), which builds its graph with the engine's own
+# ``Graph.from_data``. The hosted backend (KUMO_HOSTED_API_URL) describes its
+# graph straight from the frames instead, so it runs without this extra.
+# Without either variable the extra is inert.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --no-dev --no-install-project
+    uv sync --no-dev --no-install-project --extra kumo
 
 ############################
 # Stage 2: runtime

@@ -703,6 +703,7 @@ def test_graph_wires_refinement_before_sql_construction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("KUMO_RFM_API_URL", raising=False)
+    monkeypatch.delenv("KUMO_HOSTED_API_URL", raising=False)
     edges = {
         (edge.source, edge.target, edge.conditional)
         for edge in create_graph().compile().get_graph().edges

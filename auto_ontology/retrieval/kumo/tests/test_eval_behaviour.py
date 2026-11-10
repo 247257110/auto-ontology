@@ -153,7 +153,7 @@ def test_a_forecast_over_stale_data_says_where_it_is_anchored() -> None:
     assert anchor < today
     assert note is not None
     assert str(anchor.date()) in note
-    assert "not from today" in note
+    assert "不是从今天起算" in note
 
 
 def test_a_warehouse_loaded_on_a_delay_is_not_flagged_every_time() -> None:

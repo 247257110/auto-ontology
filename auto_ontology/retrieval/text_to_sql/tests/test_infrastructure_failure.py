@@ -131,7 +131,7 @@ def test_falls_back_to_a_generic_explanation() -> None:
 
     final = SQLUnconstructableAgent().execute(state)["path_state"]["final_response"]
 
-    assert final["response"] == "SQL can't be constructed from the data."
+    assert final["response"] == "无法用现有数据构造出这条 SQL。"
 
 
 def test_the_loop_uses_seven_reconstructions() -> None:

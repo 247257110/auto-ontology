@@ -24,7 +24,10 @@ from typing import Any, Dict
 from langchain_core.messages import AIMessage
 from auto_ontology.catalog.constants import Labels
 
-from auto_ontology.dal.datasources import fetch_table_by_name
+from auto_ontology.dal.datasources import (
+    fetch_table_by_name,
+    fetch_table_in_database,
+)
 from auto_ontology.retrieval.kumo import PredictionContext, build_prediction_context
 from auto_ontology.retrieval.kumo.pql_gen import _TABLE_COL
 from auto_ontology.retrieval.kumo.rag import fetch_pql_examples
@@ -52,41 +55,70 @@ def _pql_tables(pql: str) -> set[str]:
     return {m.group(1) for m in _TABLE_COL.finditer(pql or "")}
 
 
+def _scope_database(relevant_tables: list[dict[str, Any]]) -> str:
+    """The database the relevant tables belong to, or ``''`` when unknown."""
+    for table in relevant_tables:
+        name = str(table.get("database_name") or "").strip()
+        if name:
+            return name
+    return ""
+
+
 def _enrich_relevant_tables(
     relevant_tables: list[dict[str, Any]],
     examples: list[dict[str, str]],
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
     """Add any table referenced by a retrieved PQL example but missing from
     ``relevant_tables``, resolved from the catalog by name.
 
     Done BEFORE the graph is built so the added tables are loaded into the graph
     (and auto-linked by metadata inference) — the LLM is guided by these examples,
     so every table they reference must exist in the graph or the PQL won't parse.
+
+    Two scoping rules, both learned from a deployment with two connected
+    databases:
+
+    * **Look the table up inside the scoped database only.** A bare name is not
+      unique — ``invoices`` exists in both ``wideworldimporters.sales`` and the
+      retail database — and an unscoped lookup returns whichever was ingested
+      first along with *its* schema name, which the caller then runs on the
+      other database's connection.
+    * **Drop examples that cite a table the scoped database does not have.** A
+      corpus verified against one database will otherwise describe tables that
+      do not exist here, and the model follows the example it was shown.
+
+    Returns the enriched tables and the examples that survived.
     """
     existing = {str(t.get("name") or "").upper() for t in relevant_tables}
-    referenced: set[str] = set()
-    for ex in examples:
-        referenced |= _pql_tables(ex.get("query") or "")
+    database_name = _scope_database(relevant_tables)
 
     enriched = list(relevant_tables)
     added: list[str] = []
-    for name in sorted(referenced):
+    resolvable = set(existing)
+    for name in sorted({n for ex in examples for n in _pql_tables(ex.get("query") or "")}):
         if name.upper() in existing:
             continue
-        row = fetch_table_by_name(name)
+        row = (
+            fetch_table_in_database(name, database_name)
+            if database_name
+            else fetch_table_by_name(name)
+        )
         if not row or not row.get("name"):
+            # Not in this database: the example that named it cannot be followed.
             continue
         enriched.append(
             {
                 "id": row.get("id"),
                 "name": row.get("name"),
                 "schema_name": row.get("schema_name") or "",
+                "database_name": row.get("database_name") or database_name,
                 "description": row.get("description") or "",
                 "pk": row.get("pk"),
                 "label": Labels.TABLE,
             }
         )
         existing.add(name.upper())
+        resolvable.add(row["name"].upper())
         added.append(row["name"])
     if added:
         logger.info(
@@ -94,7 +126,27 @@ def _enrich_relevant_tables(
             len(added),
             added,
         )
-    return enriched
+
+    usable: list[dict[str, str]] = []
+    for example in examples:
+        cited = _pql_tables(example.get("query") or "")
+        missing = {name for name in cited if name.upper() not in resolvable}
+        if missing:
+            logger.info(
+                "kumo: dropping PQL example citing table(s) absent from %s: %s",
+                database_name or "(unscoped)",
+                ", ".join(sorted(missing)),
+            )
+            continue
+        usable.append(example)
+    if len(usable) != len(examples):
+        logger.info(
+            "kumo: kept %d of %d PQL example(s) after scoping to %s",
+            len(usable),
+            len(examples),
+            database_name or "(unscoped)",
+        )
+    return enriched, usable
 
 
 class PredictionGraphAgent(BaseAgent):
@@ -116,7 +168,9 @@ class PredictionGraphAgent(BaseAgent):
         )
         # Enrich the table set with any table the examples reference before the
         # graph is built, so the LLM can never cite a table absent from the graph.
-        relevant_tables = _enrich_relevant_tables(relevant_tables, examples)
+        # Examples citing tables this database does not have are dropped here for
+        # the same reason.
+        relevant_tables, examples = _enrich_relevant_tables(relevant_tables, examples)
 
         try:
             context = build_prediction_context(
@@ -128,8 +182,8 @@ class PredictionGraphAgent(BaseAgent):
         except Exception as exc:
             self.logger.exception("KumoRFM graph preparation failed")
             context = _error_response(
-                "I couldn't prepare a prediction for this question. "
-                f"({type(exc).__name__}: {exc})"
+                "这个问题的预测图没能准备好。"
+                f"（{type(exc).__name__}: {exc}）"
             )
 
         if isinstance(context, PredictionContext):

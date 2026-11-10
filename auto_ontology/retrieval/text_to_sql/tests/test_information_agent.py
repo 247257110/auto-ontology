@@ -164,7 +164,7 @@ def test_llm_failure_returns_safe_non_sql_response(
     result = InformationAgent().execute(_state())
 
     response = result["path_state"]["final_response"]
-    assert "couldn't complete the metadata lookup safely" in response["response"]
+    assert "没能安全完成" in response["response"]
     assert "Revenue" in response["response"]
     assert response["sql_code"] == ""
     assert result["path_state"]["information_tool_calls"] == []
@@ -301,4 +301,4 @@ def test_reasoning_limit_stops_repeated_calls(
     result = InformationAgent().execute(_state())
 
     assert len(tool_calls) == 1
-    assert "reasoning limit" in result["path_state"]["final_response"]["response"]
+    assert "推理轮次上限" in result["path_state"]["final_response"]["response"]

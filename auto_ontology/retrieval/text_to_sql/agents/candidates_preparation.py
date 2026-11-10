@@ -1258,7 +1258,9 @@ class CandidatePreparationAgent(BaseAgent):
                     "Return the id of the single column attribute that best represents "
                     "the primary subject of the question. Map evidence concepts to "
                     "the listed schema.table.column physical references, not to "
-                    "semantic attribute names."
+                    "semantic attribute names. Write the reasoning field in Simplified "
+                    "Chinese (简体中文): it is shown verbatim as the thinking line in "
+                    "a Chinese chat UI, so keep column names and ids exactly as listed."
                 )
             ),
         ]
