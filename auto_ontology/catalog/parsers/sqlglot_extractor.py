@@ -751,9 +751,18 @@ def extract_tables_and_columns(
     )
     union_pairs = _extract_union_pairs(qualified, alias_map, source_table_names)
 
-    # Drop real-table entries that ended up with no columns attributed.
+    # Keep every real source table, including ones no column was traced to.
+    #
+    # ``COUNT(*)``, ``SELECT 1 FROM t`` and ``SELECT COUNT(*) FROM a, b``
+    # reference a table without ever naming one of its columns, so dropping
+    # column-less entries reported "no tables" for a perfectly valid query.
+    # Downstream (``parse_query_slim``) reads an empty table set as "the SQL
+    # references nothing in the catalog" and the whole question then fails as
+    # unconstructable after exhausting the rewrite loop. A table in FROM/JOIN
+    # is used whether or not a column led to it; the column trace only adds
+    # detail.
     return ExtractionResult(
-        tables={k: v for k, v in result.items() if v.columns},
+        tables=result,
         ast_node_count=ast_node_count,
         joins=join_pairs,
         unions=union_pairs,

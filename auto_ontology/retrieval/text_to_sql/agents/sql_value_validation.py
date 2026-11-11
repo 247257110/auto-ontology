@@ -101,7 +101,14 @@ class ValueValidationAction(StrictLLMOutputModel):
     action: ValueValidationActionType
     arguments: ValueQueryArguments | None = None
     substitutions: list[ValueSubstitution] = Field(default_factory=list)
-    reasoning: str = ""
+    reasoning: str = Field(
+        default="",
+        description=(
+            "One or two sentences on what you checked and concluded. Write this "
+            "in Simplified Chinese (简体中文): it is shown verbatim as the "
+            "thinking line in a Chinese chat UI."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_action(self) -> "ValueValidationAction":
@@ -701,7 +708,7 @@ class SQLValueValidationAgent(BaseAgent):
                 path_state,
                 _GRAPH_NODE_NAME,
                 action.reasoning.strip()
-                or f"Validated values and applied {len(accepted)} correction(s).",
+                or f"已校验筛选值，应用 {len(accepted)} 处修正。",
             )
         elif final_valid and action.reasoning.strip():
             record_thought(path_state, _GRAPH_NODE_NAME, action.reasoning.strip())

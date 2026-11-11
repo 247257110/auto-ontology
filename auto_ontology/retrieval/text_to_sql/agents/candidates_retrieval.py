@@ -38,6 +38,13 @@ from auto_ontology.dal.custom_analyses import custom_analysis_exists
 from auto_ontology.retrieval.data_access.semantic_search import search_semantic_index
 from auto_ontology.utils.llm_invoke import invoke_with_structured_output
 from auto_ontology.retrieval.text_to_sql.base import BaseAgent
+from auto_ontology.retrieval.text_to_sql.database_scope import (
+    SCOPE_DEFAULT,
+    SCOPE_PREDICTION_DEFAULT,
+    configured_default_target_db,
+    configured_prediction_target_db,
+    resolve_effective_target_db,
+)
 from auto_ontology.retrieval.text_to_sql.models import (
     CandidateFilterModel,
     ColumnAttributeSpec,
@@ -470,7 +477,37 @@ class CandidateRetrievalAgent(BaseAgent):
         )
         llm = state["llm"]
         semantic_retriever = state.get("semantic_retriever")
-        target_db = path_state.get("target_db")
+        target_db, scope_reason = resolve_effective_target_db(
+            requested=path_state.get("target_db"),
+            question_type=path_state.get("question_type"),
+            question=question,
+            connectors=state.get("connectors") or [],
+            default=configured_default_target_db(),
+            prediction_default=configured_prediction_target_db(),
+        )
+        if scope_reason == SCOPE_DEFAULT:
+            # No database was named and the deployment pins one. Skipping the
+            # vote here is the point: two libraries that model the same
+            # business produce near-identical hits, and the tie-break is the
+            # database name.
+            self.logger.info(
+                "Default database scope applied: %r (question named no database)",
+                target_db,
+            )
+        elif scope_reason == SCOPE_PREDICTION_DEFAULT:
+            # A forecast is scoped to the library it was trained and scored
+            # against. Left to the vote it lands on whichever database has the
+            # most matching columns — which is the warehouse, and the run then
+            # dies resolving a table only the other library has.
+            self.logger.info(
+                "Prediction database scope applied: %r (question named no database)",
+                target_db,
+            )
+        elif scope_reason.startswith(("skipped", "prediction-skipped")):
+            self.logger.info(
+                "Database scope pin not applied (%s); candidate vote decides",
+                scope_reason,
+            )
         raw_evidence = state.get("evidence")
         evidence = (
             raw_evidence.strip()

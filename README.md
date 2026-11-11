@@ -106,7 +106,7 @@ Microsoft's sample sales database. You need Docker with Compose v2,
    AUTH_SECRET=<a long random string, e.g. from openssl rand -base64 32>
    APP_URL=http://localhost:3000
    POSTGRES_PASSWORD=<a new password>
-   CONNECTION_STRINGS=postgresql://postgres:<the same password>@postgres:5432/wideworldimporters
+   SOURCE_CONNECTION_STRINGS=postgresql://postgres:<the same password>@postgres:5432/wideworldimporters
    AUTO_ONTOLOGY_ADMIN_PASSWORD=<a new password>
    PGADMIN_PASSWORD=<a new password>
    ```
@@ -115,6 +115,14 @@ Microsoft's sample sales database. You need Docker with Compose v2,
    each default password before you start it. `.env.example` also sets an API
    key per model role: replace each `nvapi-your-api-key-here` with your key, or
    delete those lines so they fall back to `DEFAULT_MODELS_API_KEY`.
+
+   Use `SOURCE_CONNECTION_STRINGS` for Compose, not `CONNECTION_STRINGS`: inside
+   a container the database is the service name `postgres`, and `localhost`
+   there means the container itself, which fails with
+   `connection to server at "::1", port 5432 failed: Connection refused`.
+   `CONNECTION_STRINGS` stays the host-side value (host, `127.0.0.1`) for
+   `uv run` and `dev_tools/`; Compose falls back to it only when
+   `SOURCE_CONNECTION_STRINGS` is empty.
 
 2. Start Postgres and load the sample database. The seed script lives in
    auto-ontology-eval; pass it the Postgres password you set:
@@ -422,13 +430,60 @@ that support structured output, and keep the embedding model the same for
 ingestion and queries. [`.env.example`](./.env.example) documents every
 variable.
 
+The default models are thinking models: left uncapped they spend the whole
+`max_tokens` budget reasoning, and a text-to-SQL run makes roughly ten structured
+calls. One call measured 20-115 s uncapped against 7-12 s with
+`LLM_MAX_THINKING_TOKENS=512`, which the chat UI shows as an answer that never
+arrives. Set it (or `0` to disable thinking) when you use a thinking model;
+leave it unset for non-thinking models, which ignore the field, and for
+endpoints that reject unknown `nvext` members.
+
+Newer NVIDIA router-served models (`nvidia/nemotron-3.5-*`) are missing from the
+client library's bundled model registry, so it warns that they are unknown and
+"not known to support structured output" — a false negative: they answer the
+same schema through the OpenAI `response_format` path. On the hosted API,
+`llm_invoke` registers such a model with its real capabilities the first time it
+is used, which silences both warnings without changing the inference path.
+Self-hosted NIMs keep the warning, because there the capabilities genuinely
+cannot be known.
+
+`nemotron-3.5-embed-1b`, the default `EMBED` model, intermittently answers
+batched embedding requests with `500 service inference failed` — measured at
+roughly one batch in three — and an ingestion chunk retries as a unit, so a
+single bad batch drops every row in it. `nvidia/nemotron-3-embed-1b` is the
+same 2048 dimensions and batches reliably; swap `EMBED_MODEL` to it if
+ingestion reports `0/640 row(s) embedded`.
+
 ### Predictions
 
-Set `KUMO_RFM_API_KEY` and the agent routes predictive questions to KumoRFM.
-KumoRFM is a hosted service: to answer, the agent uploads the connected tables
-to it, capped by `KUMO_MAX_TABLES` (20 by default) and
-`KUMO_MAX_ROWS_PER_TABLE` (unlimited unless set). Review what that sends, and
-complete your organization's data review, before you enable it.
+Two backends serve the `kumo-relational` model. Set either URL and the agent
+routes predictive questions to it; the URL is the switch, evaluated once at
+startup. `KUMO_RFM_API_URL` wins when both are set.
+
+**Self-hosted NIM.** `KUMO_RFM_API_URL` names a Universal TFM NIM, which resolves
+the PQL on that host. `KUMO_RFM_API_KEY` is optional and only carries a gateway
+credential, because NIMs are unauthenticated by contract. The image must be built
+with `--extra kumo` (the provided Dockerfile is), since this backend builds its
+graph with the engine's own `Graph.from_data`.
+
+**Hosted endpoint.** `KUMO_HOSTED_API_URL` names the endpoint on
+`build.nvidia.com` — the literal value `public` selects it — and
+`KUMO_HOSTED_API_KEY` (an `nvapi-…` key) authenticates it. That endpoint accepts
+only a materialised task rather than PQL, so the query is compiled and the sample
+sliced into per-instance context/predict frames locally before upload; it needs
+no `--extra kumo`. What it cannot express is refused with a repairable message
+rather than approximated: `LIST_DISTINCT … RANK TOP` recommendations, multi-period
+`FORECAST`, `ASSUMING` counterfactuals, and an `AND`/`OR` of two targets.
+
+Answering a predictive question reads a bounded sample of the connected tables
+and sends it to the serving host, capped by `KUMO_MAX_TABLES` (20 by default),
+`KUMO_MAX_BYTES` (2 GiB) and `KUMO_MAX_BUILD_SECONDS` (300). Over-budget
+requests are refused with what they exceeded rather than truncated, so a
+prediction always answers the question that was asked. The hosted path adds
+`KUMO_HISTORY_ANCHORS` (8), `KUMO_MAX_INSTANCES` (2000) and
+`KUMO_MAX_RELATED_ROWS` (400000) to shape its payload. Review what that sends,
+and complete your organization's data review, before you enable it — a
+self-hosted NIM keeps the rows inside your network, the hosted endpoint does not.
 
 ## Integrate with us
 
@@ -445,6 +500,8 @@ workflow is in [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 | Topic                                   | Doc                                                  |
 | --------------------------------------- | ---------------------------------------------------- |
+| Chinese usage manual (中文使用手册)      | [docs/使用手册.md](./docs/使用手册.md)               |
+| Wide World Importers data dictionary (数据字典与问法) | [docs/wideworldimporters-数据字典与问法.md](./docs/wideworldimporters-数据字典与问法.md) |
 | Kubernetes deployment with Helm         | [DEPLOYMENT.md](./DEPLOYMENT.md)                     |
 | Connections, scoping, and Vault         | [docs/connections.md](./docs/connections.md)         |
 | Authentication, SSO, and API tokens     | [docs/authentication.md](./docs/authentication.md)   |
@@ -492,7 +549,10 @@ External materials Auto-Ontology interacts with at run time:
 - Model endpoints you configure, by default the NVIDIA API catalog
   (`integrate.api.nvidia.com`, `ai.api.nvidia.com`), under each provider's and
   model's terms.
-- The KumoRFM service, only when `KUMO_RFM_API_KEY` is set, under Kumo's terms.
+- The prediction backend you configure: the KumoRFM NIM named by
+  `KUMO_RFM_API_URL`, or the hosted endpoint named by `KUMO_HOSTED_API_URL`
+  (`ai.api.nvidia.com`), each only when that variable is set, under NVIDIA's
+  NIM or model terms respectively.
 - Your source databases, under your agreements for those systems.
 
 ## Security

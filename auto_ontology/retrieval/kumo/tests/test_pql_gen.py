@@ -239,3 +239,90 @@ def test_unquote_and_quote_round_trip() -> None:
     assert pql_gen.quote_name("Customer ID") == "`Customer ID`"
     assert pql_gen.quote_name("CUSTOMER_ID") == "CUSTOMER_ID"
     assert pql_gen.quote_name("*") == "*"
+
+
+_DDL = (
+    '"customers"("customer_id" ID)  -- PRIMARY KEY ("customer_id")\n'
+    '"orders"("order_id" ID, "customer_id" ID, "placed_at" timestamp)  '
+    '-- PRIMARY KEY ("order_id"); TIME COLUMN ("placed_at")'
+)
+
+
+class _AnchorWarehouse:
+    """Just enough warehouse: a data end for the anchor, ids for the scope."""
+
+    database_name = "sales"
+    dialect = "sqlite"
+
+    def __init__(self, data_end: str) -> None:
+        self.data_end = pd.Timestamp(data_end)
+
+    def execute(self, sql: str) -> pd.DataFrame:
+        if "MAX(" in sql.upper():
+            return pd.DataFrame({"m": [self.data_end]})
+        return pd.DataFrame({"customer_id": [1, 2, 3]})
+
+
+class _ScriptedLLM:
+    """One PQL per attempt — the retry gets a different window, so a different anchor."""
+
+    model_name = "stub"
+
+    def __init__(self, *replies: str) -> None:
+        self._replies = list(replies)
+        self.calls = 0
+
+    def invoke(self, *args, **kwargs) -> object:
+        reply = self._replies[min(self.calls, len(self._replies) - 1)]
+        self.calls += 1
+        return type("Reply", (), {"content": reply})()
+
+
+class _RepairingModel:
+    """Refuses the first predict so the loop has to regenerate."""
+
+    def __init__(self) -> None:
+        self.anchors: list[object] = []
+
+    def validate_pql(self, _query: str) -> None:
+        return None
+
+    def predict(self, _query: str, indices=None, **kwargs) -> pd.DataFrame:
+        self.anchors.append(kwargs.get("anchor_time"))
+        if len(self.anchors) == 1:
+            raise ValueError("'orders' has no relationship to 'customers'")
+        keys = list(indices or [])
+        return pd.DataFrame({"ENTITY": keys, "True_PROB": [0.5] * len(keys)})
+
+
+def test_a_failed_attempt_does_not_leave_its_anchor_note_behind() -> None:
+    """One note per run: the caller reads these as one statement about one forecast.
+
+    Each attempt derives its own anchor from its own PQL, so joining them without
+    a reset leaves the answer asserting two different anchor dates — neither of
+    which the failed attempt ever produced a prediction for.
+    """
+    llm = _ScriptedLLM(
+        "PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id",
+        "PREDICT COUNT(orders.*, 0, 30, days) = 0 FOR EACH customers.customer_id",
+    )
+
+    result = pql_gen.generate_pql(
+        "which customers will stop ordering?",
+        llm=llm,
+        kumo_model=_RepairingModel(),
+        connector=_AnchorWarehouse("2025-06-30"),
+        graph_ddl=_DDL,
+        graph_edges=[("orders", "customer_id", "customers")],
+        graph_col_stypes={"customers": {"customer_id": "ID"}, "orders": {}},
+        time_columns={"orders": "placed_at"},
+        max_tries=2,
+    )
+
+    assert result.success is True
+    assert result.note is not None
+    assert result.note.count("锚定在") == 1
+    # 2025-06-30 − (30 + 7) days: the window that actually ran.
+    assert "2025-05-24" in result.note
+    # 2025-06-30 − (90 + 7): the abandoned attempt's anchor.
+    assert "2025-03-25" not in result.note

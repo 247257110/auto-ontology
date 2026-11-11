@@ -138,10 +138,13 @@ _ENTITY_SQL_INSTRUCTION = (
     "2. To scope WHICH entities to score, a read-only SELECT returning ONLY the entity primary-key column in a\n"
     "   ```sql fenced block. This is REQUIRED whenever the question restricts the entities to a named subset —\n"
     '   a tier, segment, region, status, or any attribute filter (e.g. "strategic customers", "active GPUs",\n'
-    "   \"open orders\"): emit `SELECT <pk> FROM <entity_table> WHERE <attr> = '<value>'` so ONLY that subset is\n"
-    "   scored and ranked. (Use the attribute values from the Columns section.) Without it the model scores a\n"
-    "   default sample of ALL entities and the requested subset may not appear in the ranked results. Omit the\n"
-    "   block only when the question is genuinely about all entities."
+    "   \"open orders\"): emit `SELECT <pk> FROM <entity_table> WHERE <attr> = '<value>'` using the value the\n"
+    "   question itself names (verbatim from the Columns section). Without it the model scores a default sample\n"
+    "   of ALL entities and the requested subset may not appear in the ranked results.\n"
+    "   When the question names no such value, emit the block with NO WHERE clause (`SELECT <pk> FROM\n"
+    "   <entity_table>`) or omit it — never fill the WHERE with values that merely appear in the Columns section,\n"
+    "   and never add SQL comments. That block decides the population every score is relative to, so an invented\n"
+    "   filter silently changes the answer."
 )
 
 

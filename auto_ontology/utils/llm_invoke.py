@@ -47,6 +47,19 @@ class StrictLLMOutputModel(BaseModel):
 RETRY_MAX_ATTEMPTS = 3
 LLM_INVOKE_TIMEOUT_S = int(os.environ.get("LLM_INVOKE_TIMEOUT_S", "120"))
 
+# Reasoning budget for thinking models, in tokens, sent as ``nvext.max_thinking_tokens``.
+#
+# Thinking models (``nvidia/nemotron-3.5-*``, ``nvidia/nemotron-3-nano-omni-*``) spend
+# the whole ``max_tokens`` budget reasoning unless something caps it. Measured on
+# nemotron-3.5-lightning-30b-a3b with the question-intent schema (max_tokens=8192),
+# one structured call took 115s / 24s / 20s uncapped, 12s / 8s / 7s at 512, and
+# 4s / 1.2s / 1.2s at 0. A text-to-SQL run makes ~10 such calls, so uncapped
+# thinking turns a question into ten minutes of silence in the chat UI.
+#
+# Unset leaves the model's own default, because endpoints that do not implement
+# the field reject unknown ``nvext`` members outright.
+LLM_MAX_THINKING_TOKENS = os.environ.get("LLM_MAX_THINKING_TOKENS", "").strip()
+
 # Concurrent LLM requests are unbounded here by default. A process-wide cap used
 # to live at this call site, defaulting to 6, to stop semantic compilation's
 # nested fan-out (tables x terms) from saturating the endpoint's per-worker
@@ -243,6 +256,8 @@ def _build_client(
 
     from langchain_nvidia_ai_endpoints import ChatNVIDIA
 
+    _register_chatnvidia_model(model, base_url)
+
     client = ChatNVIDIA(
         model=model,
         api_key=api_key,
@@ -250,6 +265,15 @@ def _build_client(
         temperature=temperature,
         max_tokens=max_tokens,
     )
+    if LLM_MAX_THINKING_TOKENS:
+        # Chained, not replaced: a caller may already have set model_kwargs.
+        client.model_kwargs = {
+            **(client.model_kwargs or {}),
+            "nvext": {
+                **(client.model_kwargs or {}).get("nvext", {}),
+                "max_thinking_tokens": int(LLM_MAX_THINKING_TOKENS),
+            },
+        }
     client._client.get_session_fn = lambda: _TimeoutSession(LLM_INVOKE_TIMEOUT_S)
     return client
 
@@ -415,11 +439,115 @@ def _ensure_non_system_message(messages: list[BaseMessage]) -> list[BaseMessage]
     return converted
 
 
+def _is_chatnvidia(llm: BaseChatModel) -> bool:
+    """True when *llm* is a ``ChatNVIDIA`` client."""
+    return type(llm).__name__ == "ChatNVIDIA"
+
+
+# Models this process has already taught the client library about. See
+# :func:`_register_chatnvidia_model`.
+_REGISTERED_NVIDIA_MODELS: set[str] = set()
+
+# The hosted NVIDIA API, whose model listing omits some router-served ids.
+_HOSTED_NVIDIA_HOSTS = {"integrate.api.nvidia.com", "ai.api.nvidia.com"}
+
+
+def _register_chatnvidia_model(model: str, base_url: str) -> None:
+    """Teach ``langchain_nvidia_ai_endpoints`` about a model it does not know.
+
+    The bundled model registry (1.4.3, 160 entries) predates NVIDIA's
+    router-served stack, so ``nvidia/nemotron-3.5-lightning-30b-a3b`` is absent
+    from it *and* from ``GET /v1/models`` — even though inference works. The
+    client then falls back to ``Model(id=...)`` with no capability flags, which
+    makes every ``with_structured_output`` call warn::
+
+        Model 'nvidia/nemotron-3.5-lightning-30b-a3b' is not known to support
+        structured output. Your output may fail at inference time.
+
+    That warning is a false negative: the model answers the very same schema via
+    the OpenAI ``response_format`` path in ~6s. Registering the model with its
+    real capabilities silences it at the source (and the "Model ... is unknown"
+    warning at construction) instead of muting a warning class globally.
+
+    ``endpoint`` is a template resolved against the client's ``base_url``, so it
+    reproduces the default inference path exactly and changes no request.
+
+    Only done for the hosted NVIDIA API: for a self-hosted NIM we cannot know
+    the capabilities, and there the warning is worth keeping.
+    """
+    if model in _REGISTERED_NVIDIA_MODELS:
+        return
+    _REGISTERED_NVIDIA_MODELS.add(model)
+
+    from urllib.parse import urlparse
+
+    if urlparse(base_url).netloc not in _HOSTED_NVIDIA_HOSTS:
+        return
+
+    try:
+        from langchain_nvidia_ai_endpoints import Model, register_model
+        from langchain_nvidia_ai_endpoints._statics import MODEL_TABLE
+    except ImportError:  # library internals moved; the warning is harmless
+        return
+
+    if model in MODEL_TABLE:  # genuinely known: keep its own metadata
+        return
+
+    try:
+        register_model(
+            Model(
+                id=model,
+                model_type="chat",
+                client="ChatNVIDIA",
+                endpoint="{base_url}/chat/completions",
+                supports_structured_output=True,
+                supports_thinking=True,
+            )
+        )
+        logger.info("Registered %s with the NVIDIA model registry", model)
+    except Exception:  # never let model bookkeeping break client construction
+        logger.debug("Could not register %s with the NVIDIA registry", model)
+
+
 def _is_claude(llm: BaseChatModel) -> bool:
     """True when *llm* serves an Anthropic/Claude model, matched by name."""
     model = str(getattr(llm, "model_name", "") or getattr(llm, "model", "") or "")
     lowered = model.lower()
     return "anthropic" in lowered or "claude" in lowered
+
+
+def _model_name(llm: BaseChatModel) -> str:
+    """The served model id of *llm*, or ``""`` when the client exposes none."""
+    return str(getattr(llm, "model_name", "") or getattr(llm, "model", "") or "")
+
+
+# Models measured to reject ``nvext.guided_json`` (NVIDIA's router-served stack
+# accepts ``response_format`` instead). Filled lazily by :func:`_pin_json_schema`
+# so a model is only pinned after it has actually refused guided decoding, and
+# every later call for it skips the doomed request entirely.
+_JSON_SCHEMA_ONLY_MODELS: set[str] = set()
+
+# The one substring that identifies the rejection. Matching on it rather than on
+# a model allowlist keeps this working for models that do not exist yet.
+_GUIDED_JSON_REJECTION = "unknown field `guided_json`"
+
+
+def _is_guided_json_rejection(exc: BaseException) -> bool:
+    """True when *exc* is the endpoint refusing ``guided_json`` for this model."""
+    return _GUIDED_JSON_REJECTION in str(exc)
+
+
+def _pin_json_schema(llm: BaseChatModel) -> dict:
+    """Remember that *llm* needs ``response_format`` and return its kwargs."""
+    name = _model_name(llm)
+    if name and name not in _JSON_SCHEMA_ONLY_MODELS:
+        _JSON_SCHEMA_ONLY_MODELS.add(name)
+        logger.warning(
+            "Model %s rejects nvext.guided_json — switching structured output to "
+            "response_format json_schema for the rest of this process",
+            name,
+        )
+    return {"method": "json_schema"}
 
 
 def _system_messages_first(
@@ -471,9 +599,19 @@ def _structured_output_kwargs(llm: BaseChatModel) -> dict:
     "required", and langchain's default of naming the tool) hits that conflict, and only
     omitting it succeeds. The model still calls the tool without being forced to, and
     the caller retries if it ever answers without one.
+
+    ``ChatNVIDIA`` picks its own structured-output mechanism and *ignores* a
+    ``method`` argument (it warns "The 'method' parameter is unnecessary and is
+    ignored"). Since 1.4.3 it already tries the OpenAI ``response_format`` path
+    first on a hosted endpoint and falls back to guided decoding, so it needs no
+    hint from us — passing one only adds a warning per call.
     """
+    if _is_chatnvidia(llm):
+        return {}
     if _is_claude(llm):
         return {"method": "function_calling", "tool_choice": None}
+    if _model_name(llm) in _JSON_SCHEMA_ONLY_MODELS:
+        return {"method": "json_schema"}
     return {}
 
 
@@ -565,9 +703,32 @@ def safe_invoke_with_structured_output(
 
     for attempt in range(RETRY_MAX_ATTEMPTS):
         try:
-            model_llm = llm.with_structured_output(schema, **structured_kwargs)
-            with _inflight_guard():
-                result = model_llm.invoke(_system_messages_first(llm, current_messages))
+            try:
+                model_llm = llm.with_structured_output(schema, **structured_kwargs)
+                with _inflight_guard():
+                    result = model_llm.invoke(
+                        _system_messages_first(llm, current_messages)
+                    )
+            except Exception as guided_exc:
+                # Not a transient failure: this model's backend does not implement
+                # guided decoding at all, so retrying the same shape can only fail
+                # again. Re-issue once with the response_format path, and pin the
+                # model so the next call starts there.
+                if not _is_guided_json_rejection(guided_exc):
+                    raise
+                if _is_chatnvidia(llm):
+                    # A hosted ChatNVIDIA client already tried response_format
+                    # before guided decoding, so this error means that first path
+                    # failed too (typically an empty answer when a thinking model
+                    # spends all of max_tokens reasoning). method is ignored by
+                    # the library, so a retry cannot change the outcome.
+                    raise
+                structured_kwargs = _pin_json_schema(llm)
+                model_llm = llm.with_structured_output(schema, **structured_kwargs)
+                with _inflight_guard():
+                    result = model_llm.invoke(
+                        _system_messages_first(llm, current_messages)
+                    )
         except _requests.exceptions.ReadTimeout:
             logger.error(
                 "LLM invoke timed out after %ds on attempt %d/%d for %s",

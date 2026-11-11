@@ -71,7 +71,14 @@ class InformationAgentAction(StrictLLMOutputModel):
     action: InformationActionType
     tool: InformationToolName | None = None
     arguments: InformationToolArguments | None = None
-    answer: str | None = None
+    answer: str | None = Field(
+        default=None,
+        description=(
+            "The final answer, as concise Markdown written in Simplified Chinese "
+            "(简体中文). Keep dataset, schema, table, column and Term names "
+            "exactly as they appear in the metadata — do not translate them."
+        ),
+    )
     source_ids: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -157,46 +164,46 @@ def _render_prompt(
         observation_text = observation_text[-MAX_OBSERVATION_CHARS:]
         observation_text = "[earlier observations omitted] " + observation_text
 
-    return f"""You answer questions about data catalog metadata. You do not query source
-data and you do not write SQL. Use only the supplied candidates and read-only tool
-observations. Never invent tables, columns, formulas, descriptions, or relationships.
+    # The instructions are written in Chinese on purpose: the answer language
+    # follows the language of the prompt far more reliably than it follows an
+    # instruction *about* language. Asking for Chinese inside an English prompt
+    # was tried and the model still answered in English.
+    return f"""你负责回答关于数据目录元数据的问题。不要查询源数据，也不要写 SQL。
+只使用给定的候选项和只读工具的返回结果，绝不编造表、列、公式、描述或关系。
+所有面向用户的文字（最终的 answer）都用简体中文写；数据集、schema、表、列和 Term
+的名字保持元数据里的原样，不翻译、不改大小写。
 
-Available tools:
-- list_databases: catalog databases (the root of the lazy data tree).
-- list_schemas: schemas for a database_id.
-- list_tables: tables for a schema_id.
-- list_columns: a bounded column page for a table_id, with skip/limit.
-- get_dataset: dataset identity plus bounded schemas and tables.
-- get_table: table details, columns, semantic attributes, and connected tables.
-- get_column: column details, calculation/semantic attributes, owning table, and
-  connected tables.
-- get_table_semantic_fks: semantic foreign-key connections for a table.
-- get_term: one glossary Term with its represented tables, ColumnAttributes, and
-  SqlAttributes.
-- list_terms: bounded glossary browsing, optionally filtered by search text.
-- get_column_attribute: one semantic ColumnAttribute with its Term, primary/referencing
-  columns, descriptions, samples, and relationships.
-- get_sql_attribute: one derived SqlAttribute with its Term, expression, and full SQL.
-- search_semantic_layer: vector-search Terms, ColumnAttributes, SqlAttributes, and
-  CustomAnalyses when the supplied candidates do not identify the right metadata.
+可用工具：
+- list_databases：目录下的数据库（懒加载数据树的根）。
+- list_schemas：某个 database_id 下的 schema。
+- list_tables：某个 schema_id 下的表。
+- list_columns：某个 table_id 的列分页，支持 skip/limit。
+- get_dataset：数据集标识，以及有数量上限的 schema 和表。
+- get_table：表详情、列、语义属性、关联表。
+- get_column：列详情、计算/语义属性、所属表、关联表。
+- get_table_semantic_fks：某张表的语义外键连接。
+- get_term：单个术语（Term），及其代表的表、ColumnAttribute 和 SqlAttribute。
+- list_terms：术语表分页浏览，可按搜索文本过滤。
+- get_column_attribute：单个语义 ColumnAttribute，及其 Term、主列/引用列、描述、样例和关系。
+- get_sql_attribute：单个派生 SqlAttribute，及其 Term、表达式和完整 SQL。
+- search_semantic_layer：当给定候选项找不到正确元数据时，向量检索 Term、
+  ColumnAttribute、SqlAttribute 和 CustomAnalysis。
 
-Prefer IDs already present in candidates or observations. Use the dataset name to
-scope name lookups. Prefer exact metadata tools over vector search when an ID or exact
-name is known. If the user asks how a measure is calculated or defined, report
-its description/formula or SQL semantic attributes, owning table/column, and connected
-tables. If the user asks which columns a table has, list them and its connected tables.
-State clearly when metadata is missing or ambiguous.
+优先使用候选项或工具返回里已有的 ID。按名称查找时用数据集名限定范围。已知 ID 或
+确切名称时，优先用精确的元数据工具而不是向量检索。如果用户问某个度量如何计算或
+如何定义，报告它的描述/公式或 SQL 语义属性、所属表/列，以及关联表。如果用户问
+某张表有哪些列，列出这些列及其关联表。元数据缺失或有歧义时要明确说出来。
 
-Return action="tool" when more metadata is needed. Return action="answer" once the
-question can be answered. For the final answer, provide concise Markdown and list the
-catalog IDs actually supporting it in source_ids. Do not expose this workflow.
+需要更多元数据时返回 action="tool"；问题可以回答时返回 action="answer"。
+最终答案用简洁的中文 Markdown，并在 source_ids 里列出真正支撑该答案的目录 ID。
+不要暴露这套工作流程。
 
-Tool calls remaining: {tool_calls_remaining}
+剩余工具调用次数：{tool_calls_remaining}
 
-Initial context:
+初始上下文：
 {json.dumps(context, default=str, ensure_ascii=False)}
 
-Tool observations:
+工具返回：
 {observation_text}
 """
 
@@ -239,15 +246,8 @@ def _fallback_answer(context: dict[str, Any], reason: str) -> str:
         for candidate in candidates[:5]
     ]
     names = [name for name in names if name]
-    candidate_note = (
-        "\n\nRelevant catalog candidates found: " + ", ".join(names) + "."
-        if names
-        else ""
-    )
-    return (
-        "I couldn't complete the metadata lookup safely. "
-        f"{reason} No source data was queried.{candidate_note}"
-    )
+    candidate_note = "\n\n找到的相关候选项：" + "、".join(names) + "。" if names else ""
+    return f"这次元数据查询没能安全完成。{reason} 没有查询任何源数据。{candidate_note}"
 
 
 def _final_response(answer: str, column_ids: list[str]) -> dict[str, Any]:
@@ -298,9 +298,7 @@ class InformationAgent(BaseAgent):
                 action = None
 
             if action is None:
-                answer = _fallback_answer(
-                    context, "The metadata reasoning step failed."
-                )
+                answer = _fallback_answer(context, "元数据推理步骤失败。")
                 break
 
             if action.action == InformationActionType.ANSWER:
@@ -331,9 +329,7 @@ class InformationAgent(BaseAgent):
                 )
                 continue
             if tool_call_count >= MAX_TOOL_CALLS:
-                answer = _fallback_answer(
-                    context, "The metadata lookup reached its tool-call limit."
-                )
+                answer = _fallback_answer(context, "元数据查询到达了工具调用上限。")
                 break
 
             seen_calls.add(signature)
@@ -371,9 +367,7 @@ class InformationAgent(BaseAgent):
             known_column_ids.update(_collect_column_ids(result))
 
         if answer is None:
-            answer = _fallback_answer(
-                context, "The metadata lookup reached its reasoning limit."
-            )
+            answer = _fallback_answer(context, "元数据查询到达了推理轮次上限。")
 
         sources = [
             source_id for source_id in final_source_ids if source_id in known_source_ids

@@ -180,10 +180,10 @@ def _schema(db_name: str, db_id: str, schema_name: str) -> str:
 def test_parent_id_lands_in_the_child_column() -> None:
     name = _db_name()
     db_id = _database(name)
-    _schema(name, db_id, "shop")
+    schema_id = _schema(name, db_id, "shop")
 
     rows = store().query_read(
-        s.catalog_schema.select().where(s.catalog_schema.c.name == "shop")
+        s.catalog_schema.select().where(s.catalog_schema.c.id == schema_id)
     )
     assert len(rows) == 1
     assert rows[0]["database_id"] == db_id
@@ -225,7 +225,7 @@ def test_parent_link_is_idempotent() -> None:
 
     assert first == second
     rows = store().query_read(
-        s.catalog_schema.select().where(s.catalog_schema.c.name == "shop")
+        s.catalog_schema.select().where(s.catalog_schema.c.id == first)
     )
     assert len(rows) == 1
 

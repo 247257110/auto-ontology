@@ -136,8 +136,8 @@ def test_a_truncated_answer_names_what_it_left_out() -> None:
 
     response = _format_result(Result())["response"]
 
-    assert "2,000 of 48,391" in response
-    assert "not the whole population" in response
+    assert "48,391" in response and "2,000" in response
+    assert "不代表全量" in response
 
 
 def test_an_answer_over_everything_does_not_apologise_for_it() -> None:
@@ -156,8 +156,8 @@ def test_an_answer_over_everything_does_not_apologise_for_it() -> None:
 
     response = _format_result(Result())["response"]
 
-    assert "KumoRFM scored 40 entities." in response
-    assert "whole population" not in response
+    assert "共对 40 个实体做了打分" in response
+    assert "全量" not in response
 
 
 def test_predict_all_refuses_a_population_it_cannot_cover() -> None:

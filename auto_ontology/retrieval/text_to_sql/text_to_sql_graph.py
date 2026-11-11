@@ -160,40 +160,31 @@ def _make_soft_check_router(check_name: str):
     return _route
 
 
-def route_translation(state: AgentState) -> str:
-    """
-    Route to translation or graph END based on target language and context.
-
-    This function does NOT modify state. It only decides whether we need
-    to translate the final_response or end the graph.
-
-    Returns:
-        - "translate": if translation is needed
-        - "end": if no translation is needed
-    """
-    language = state.get("language", "english") or "english"
-    if language.lower() != "english":
-        # Non-English target language → request translation
-        return "translate"
-
-    # English (or unknown) → no translation
-    return "end"
-
-
 def _prediction_enabled() -> bool:
     """Whether the KumoRFM prediction branch should be built into the graph.
 
-    Evaluated ONCE at graph-creation (startup), not per request: when
-    ``KUMO_RFM_API_URL`` is unset the prediction nodes/edges are never added, so
-    the classify → prepare-graph → predict path simply does not exist.
+    Evaluated ONCE at graph-creation (startup), not per request: when neither URL
+    is set the prediction nodes/edges are never added, so the classify →
+    prepare-graph → predict path simply does not exist.
 
-    The URL is what makes prediction possible. It must name a Universal TFM NIM
-    serving the ``kumo-relational`` model; a NIM serving the older ``kumo-rfm``
-    is refused by the client at startup. NIMs are unauthenticated by contract,
-    so ``KUMO_RFM_API_KEY`` is optional and only carries a gateway credential
-    when a deployment adds one.
+    Two backends serve the ``kumo-relational`` model, and either variable turns
+    the branch on:
+
+    * ``KUMO_RFM_API_URL`` — a self-hosted Universal TFM NIM. It speaks the
+      engine protocol, so the client resolves the PQL on that host. Data never
+      leaves the deployment.
+    * ``KUMO_HOSTED_API_URL`` — the hosted endpoint on ``build.nvidia.com``
+      (the literal value ``public`` selects it). It accepts only a materialised
+      task, so the PQL is resolved locally and the sampled rows are uploaded
+      for the call.
+
+    The first wins when both are set. ``KUMO_RFM_API_KEY`` is optional for a NIM
+    (unauthenticated by contract) and required for the hosted path, where it is
+    spelled ``KUMO_HOSTED_API_KEY``.
     """
-    return bool(os.environ.get("KUMO_RFM_API_URL"))
+    return bool(
+        os.environ.get("KUMO_RFM_API_URL") or os.environ.get("KUMO_HOSTED_API_URL")
+    )
 
 
 def route_decision(state: AgentState) -> str:

@@ -23,9 +23,10 @@ import dataclasses
 import hashlib
 import logging
 import os
+import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import pandas as pd
@@ -35,7 +36,10 @@ from auto_ontology.retrieval.kumo.budget import (
     RefusedForCapacity,
     Spend,
 )
-from auto_ontology.retrieval.kumo.column_reference import build_column_reference
+from auto_ontology.retrieval.kumo.column_reference import (
+    _SENSITIVE_COLUMN_NAMES,
+    build_column_reference,
+)
 from auto_ontology.retrieval.kumo.graph_cache import (
     BuildTimedOut,
     CacheKey,
@@ -44,7 +48,8 @@ from auto_ontology.retrieval.kumo.graph_cache import (
     catalog_fingerprint,
     join_fingerprint,
 )
-from auto_ontology.retrieval.kumo.pql_gen import quote_ident
+from auto_ontology.retrieval.kumo.hosted import hosted_enabled, hosted_url
+from auto_ontology.retrieval.kumo.pql_gen import quote_ident, sql_literal
 from auto_ontology.retrieval.kumo.kumo_model import key_columns
 from auto_ontology.retrieval.kumo.telemetry import (
     CACHE_DISABLED,
@@ -164,39 +169,62 @@ def _load_relevant_frames(
     connectors: list[Any],
     relevant_tables: list[dict[str, Any]],
     spend: Spend,
-) -> tuple[dict[str, pd.DataFrame], dict[str, str], dict[str, list[str]]]:
+) -> tuple[
+    dict[str, pd.DataFrame], dict[str, str], dict[str, list[str]], dict[str, Any]
+]:
     """Load a bounded sample of each relevant table into a DataFrame.
 
     Iterates only the tables the candidate-preparation step already found relevant
     (no full-catalog scan). Each table's connector is resolved by ``database_name``,
     falling back to the first connector.
 
-    Returns ``(frames, name_map, key_columns)`` where ``name_map`` maps each graph
-    table name to its schema-qualified SQL name (used to schema-qualify
-    entity-selection SQL) and ``key_columns`` maps it to the catalog's primary-key
-    columns (see :func:`_declare_primary_keys`). Both are keyed by the graph table
-    name chosen here, so neither has to re-derive it.
+    Returns ``(frames, name_map, key_columns, used_connectors)`` where ``name_map``
+    maps each graph table name to its schema-qualified SQL name (used to
+    schema-qualify entity-selection SQL) and ``key_columns`` maps it to the
+    catalog's primary-key columns (see :func:`_declare_primary_keys`). Both are
+    keyed by the graph table name chosen here, so neither has to re-derive it;
+    ``used_connectors`` records the same keying for the connection each table was
+    actually read through.
     """
     if not connectors or not relevant_tables:
-        return {}, {}, {}
+        return {}, {}, {}, {}
 
     db_to_connector = {
         str(getattr(c, "database_name", "") or ""): c for c in connectors
     }
-    default_connector = connectors[0]
+    # Only unambiguous when one database is connected. With several, a table that
+    # carries no ``database_name`` cannot be routed: reading it through the first
+    # connector means running another database's schema-qualified name against
+    # the wrong connection, which surfaces as an ``UndefinedTable`` naming a table
+    # nobody asked about.
+    only_connector = connectors[0] if len(connectors) == 1 else None
 
     frames: dict[str, pd.DataFrame] = {}
     name_map: dict[str, str] = {}
     key_columns: dict[str, list[str]] = {}
+    used_connectors: dict[str, Any] = {}
     for t in relevant_tables:
         spend.check_deadline("reading tables")
         table = str(t.get("name") or "").strip()
         if not table:
             continue
         schema = str(t.get("schema_name") or "").strip()
-        connector = db_to_connector.get(
-            str(t.get("database_name") or ""), default_connector
-        )
+        table_database = str(t.get("database_name") or "").strip()
+        if table_database:
+            connector = db_to_connector.get(table_database)
+            if connector is None:
+                raise TableUnavailable(
+                    f"{schema}.{table} belongs to database {table_database!r}, "
+                    "which has no configured connector, so it cannot be read."
+                )
+        elif only_connector is not None:
+            connector = only_connector
+        else:
+            raise TableUnavailable(
+                f"{schema}.{table} carries no database name and "
+                f"{len(connectors)} databases are connected, so reading it could "
+                "hit the wrong one. Set target_db to scope the question."
+            )
         name = table if table not in frames else f"{schema}_{table}"
         limit = f" LIMIT {_MAX_ROWS_PER_TABLE}" if _MAX_ROWS_PER_TABLE else ""
         logger.info(
@@ -231,12 +259,13 @@ def _load_relevant_frames(
         )
         spend.add_table(name, df)
         frames[name] = df
+        used_connectors[name] = connector
         if schema:
             name_map[name] = _quote(schema, table)
         catalog_keys = _catalog_key_columns(t)
         if catalog_keys:
             key_columns[name] = catalog_keys
-    return frames, name_map, key_columns
+    return frames, name_map, key_columns, used_connectors
 
 
 def _refused(message: str, identity: "GraphIdentity | None" = None) -> dict[str, Any]:
@@ -295,36 +324,285 @@ def _json_safe_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [{k: _json_safe(v) for k, v in row.items()} for row in rows]
 
 
-def _format_result(result: Any) -> dict[str, Any]:
+# -- naming the entity ------------------------------------------------------
+#
+# A prediction row says which entity it is about by primary key: exact, but not
+# readable. `ENTITY=509` is an answer a reader cannot act on without going to the
+# warehouse themselves to find out who 509 is. One bounded read — the keys that
+# are actually in the answer — puts the name next to the key.
+#
+# Which column holds the name is read from the catalog rather than hard-coded,
+# so this works on any schema: a name-shaped text column wins, and anything that
+# reads like a category or a personal identifier is never chosen. A schema whose
+# tables carry no such column simply gets no label, and a read that fails leaves
+# the answer exactly as it was.
+_ENV_LABELS = "KUMO_ENTITY_LABELS"
+_MAX_LABEL_KEYS = 200
+
+# Never a label: contact details, financial identifiers, personal names. These
+# identify the row, not the entity, and putting them next to a prediction would
+# spread personal data through the answer. The personal/sensitive list is the one
+# `column_reference` already uses to keep such values out of prompts — one list to
+# maintain, so a column judged too sensitive to quote cannot become a label here.
+_LABEL_EXCLUDED = re.compile(r"(?i)(?:url|website|iban|routing|account_?no)")
+# A category says what kind of entity it is, never which one.
+_LABEL_CATEGORY = re.compile(
+    r"(?i)(?:categor|_type$|^type|type_|_class|class_|group|status|_code$|^code|"
+    r"method|level|kind|grade|tier|rank|position|segment|industry|region|country|city)"
+)
+# The entity's own name. `company_name` beats a bare `name` only by being found at
+# all; both are names.
+_LABEL_ENTITY_STEMS = (
+    "company",
+    "customer",
+    "client",
+    "account",
+    "org",
+    "supplier",
+    "vendor",
+    "partner",
+    "product",
+    "item",
+    "store",
+    "branch",
+    "department",
+    "team",
+    "project",
+    "tenant",
+    "merchant",
+    "brand",
+    "legal",
+    "entity",
+    "person",
+    "member",
+    "employee",
+)
+
+
+def _labels_enabled() -> bool:
+    """Whether the extra entity-name read runs. ``KUMO_ENTITY_LABELS=0`` turns it off."""
+    return os.environ.get(_ENV_LABELS, "1").strip().casefold() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _label_rank(column: str) -> int:
+    """How well a column name reads as the entity's own name; 0 means not at all."""
+    name = column.casefold()
+    if (
+        _SENSITIVE_COLUMN_NAMES.search(name)
+        or _LABEL_EXCLUDED.search(name)
+        or _LABEL_CATEGORY.search(name)
+    ):
+        return 0
+    bare = re.sub(r"[\s_\-]", "", name)
+    if bare in {"name", "title", "label", "displayname", "fullname", "shortname"}:
+        return 4
+    if bare.endswith("name") or bare.endswith("title"):
+        if any(stem in bare for stem in _LABEL_ENTITY_STEMS):
+            return 3
+        return 1
+    return 0
+
+
+def _label_column(
+    table: str, col_stypes: dict[str, dict[str, str]] | None
+) -> str | None:
+    """The column this table names its entities with, or ``None`` when it has none."""
+    columns = (col_stypes or {}).get(table.casefold()) or {}
+    candidates = [c for c in columns if _label_rank(c) > 0]
+    if not candidates:
+        return None
+    # Deterministic: strongest name shape, then the shortest, then alphabetical — so
+    # two equally good columns never make the shown column depend on dict order.
+    return sorted(candidates, key=lambda c: (-_label_rank(c), len(c), c.casefold()))[0]
+
+
+def _column_spelling(
+    table: str, column: str, col_stypes: dict[str, dict[str, str]] | None
+) -> str:
+    """The catalog's own spelling of *column*, so a quoted read hits the real column."""
+    for known in (col_stypes or {}).get(table.casefold()) or {}:
+        if known.casefold() == column.casefold():
+            return known
+    return column
+
+
+def _sql_literal(value: Any) -> str | None:
+    """Render an entity key as a SQL literal — see :func:`pql_gen.sql_literal`."""
+    return sql_literal(value)
+
+
+def _qualified_name(table: str, table_names: dict[str, str] | None) -> str:
+    """The schema-qualified SQL name for a graph table, matching PQL casing loosely."""
+    from auto_ontology.retrieval.kumo.pql_gen import quote_ident
+
+    for known, qualified in (table_names or {}).items():
+        if known.casefold() == table.casefold():
+            return qualified
+    return quote_ident(table)
+
+
+def _connector_for(table: str, context: "PredictionContext | None") -> Any:
+    """The connector the entity's own table was read through.
+
+    A label read through the wrong connection either fails or, worse, finds a
+    same-named table holding different rows. So when the per-table routing is
+    known, a table that isn't in it gets no read at all rather than a guess.
+    """
+    if context is None:
+        return None
+    by_table = context.table_connectors
+    if by_table:
+        for known, connector in by_table.items():
+            if known.casefold() == table.casefold():
+                return connector
+        return None
+    return context.connector
+
+
+def _with_label(row: dict[str, Any], label_column: str, label: Any) -> dict[str, Any]:
+    """Put the label immediately after ``ENTITY``, keeping the rest of the order."""
+    if label_column in row:
+        return row
+    ordered: dict[str, Any] = {}
+    for key, value in row.items():
+        ordered[key] = value
+        if key == "ENTITY":
+            ordered[label_column] = label
+    if "ENTITY" not in row:
+        ordered[label_column] = label
+    return ordered
+
+
+def _entity_labels(
+    rows: list[dict[str, Any]],
+    *,
+    pql: str,
+    context: "PredictionContext | None",
+    value_columns: list[str],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Attach each row's entity name, read back by primary key.
+
+    Returns the rows (unchanged when nothing could be looked up) and the column
+    list to report, which gains the label only when at least one row got one — a
+    header for a column that is entirely empty would claim more than was found.
+    """
+    if not rows or not pql or context is None or not _labels_enabled():
+        return rows, value_columns
+    if "ENTITY" not in rows[0]:
+        return rows, value_columns
+
+    from auto_ontology.retrieval.kumo.pql_gen import parse_entity
+
+    entity = parse_entity(pql)
+    if entity is None:
+        return rows, value_columns
+    table, pk = entity
+    label_column = _label_column(table, context.graph_col_stypes)
+    connector = _connector_for(table, context)
+    if label_column is None or connector is None:
+        return rows, value_columns
+    pk = _column_spelling(table, pk, context.graph_col_stypes)
+    if label_column.casefold() == pk.casefold():
+        return rows, value_columns
+
+    keys = [lit for lit in (_sql_literal(row.get("ENTITY")) for row in rows) if lit]
+    if not keys or len(keys) > _MAX_LABEL_KEYS:
+        return rows, value_columns
+
+    from auto_ontology.retrieval.kumo.pql_gen import quote_ident
+
+    source = _qualified_name(table, context.table_names)
+    sql = (
+        f"SELECT {quote_ident(pk)}, {quote_ident(label_column)} FROM {source} "
+        f"WHERE {quote_ident(pk)} IN ({', '.join(keys)})"
+    )
+    started = time.perf_counter()
+    try:
+        frame = connector.execute(sql)
+    except Exception as error:  # noqa: BLE001 - a name is an extra, never a failure
+        logger.warning(
+            "kumo: entity label read failed for %s (%s: %s); answering without it",
+            source,
+            type(error).__name__,
+            error,
+        )
+        return rows, value_columns
+    if frame is None or frame.empty or len(frame.columns) < 2:
+        logger.info(
+            "kumo: no entity label found in %s for %d key(s)", source, len(keys)
+        )
+        return rows, value_columns
+
+    lookup = {
+        str(key): label
+        for key, label in zip(frame.iloc[:, 0], frame.iloc[:, 1])
+        if label is not None and not (isinstance(label, float) and pd.isna(label))
+    }
+    labelled: list[dict[str, Any]] = []
+    found = 0
+    for row in rows:
+        label = lookup.get(str(row.get("ENTITY")))
+        if label is None:
+            labelled.append(row)
+            continue
+        found += 1
+        labelled.append(_with_label(row, label_column, label))
+    logger.info(
+        "kumo: entity labels read from %s.%s for %d/%d row(s) in %.2fs",
+        source,
+        label_column,
+        found,
+        len(rows),
+        time.perf_counter() - started,
+    )
+    if not found:
+        return rows, value_columns
+    columns = list(value_columns)
+    if label_column not in columns:
+        position = columns.index("ENTITY") + 1 if "ENTITY" in columns else len(columns)
+        columns.insert(position, label_column)
+    return labelled, columns
+
+
+def _format_result(
+    result: Any, context: "PredictionContext | None" = None
+) -> dict[str, Any]:
     """Shape a :class:`PqlGenerationResult` into the standard response dict."""
     if not result.success:
-        message = result.error or "KumoRFM could not answer this prediction."
-        final = _error_response(f"Prediction could not be completed. {message}")
+        message = result.error or "KumoRFM 无法回答这个问题。"
+        final = _error_response(f"预测未能完成。{message}")
         final["sql_code"] = result.pql or ""
         return final
 
-    parts = [f"Prediction for: {result.question}"]
+    parts = [f"预测问题：{result.question}"]
     if result.pql:
-        parts.append(f"PQL: `{result.pql}`")
+        parts.append(f"PQL：`{result.pql}`")
     if result.note:
         parts.append(result.note)
     if result.truncated and result.population > result.num_entities:
         parts.append(
-            f"KumoRFM scored {result.num_entities:,} of {result.population:,} "
-            f"entities. These results cover only those scored, not the whole "
-            f"population."
+            f"KumoRFM 在 {result.population:,} 个实体中只对 {result.num_entities:,} 个"
+            f"做了打分。以下结果只覆盖被打分的部分，不代表全量。"
         )
     else:
-        parts.append(
-            f"KumoRFM scored {result.num_entities:,} entit"
-            f"{'y' if result.num_entities == 1 else 'ies'}."
-        )
+        parts.append(f"KumoRFM 共对 {result.num_entities:,} 个实体做了打分。")
+    rows, columns = _entity_labels(
+        result.rows,
+        pql=result.pql or "",
+        context=context,
+        value_columns=list(result.columns),
+    )
     return {
         "response": "\n\n".join(parts),
         "sql_code": result.pql or "",
-        "sql_columns": result.columns,
+        "sql_columns": columns,
         "custom_analyses_used": [],
-        "sql_response_from_db": _json_safe_rows(result.rows) or None,
+        "sql_response_from_db": _json_safe_rows(rows) or None,
     }
 
 
@@ -351,6 +629,10 @@ class PredictionContext:
     examples: list[dict[str, str]]
     column_reference: str
     identity: GraphIdentity
+    # Per graph table (casefolded), the connector it was read through. Kept because
+    # reading a table back — to name an entity, say — has to go through the same
+    # connection it was loaded from, not just the first one configured.
+    table_connectors: dict[str, Any] = field(default_factory=dict)
 
 
 def _fkey_name(fkey: Any) -> str:
@@ -620,7 +902,7 @@ def build_prediction_context(
     logger.info("kumo: build_prediction_context start")
 
     if not connectors:
-        return _refused("No database connection is configured.")
+        return _refused("没有配置数据库连接。")
 
     key = _cache_key(connectors, relevant_tables or [], join_paths)
     if key is not None:
@@ -669,6 +951,13 @@ def _worth_keeping(built: Any) -> bool:
     return built.identity.edges_from != "inferred"
 
 
+def _engine_version() -> str:
+    """The engine package version, imported only when the NIM backend is in use."""
+    import kumo_relational_client
+
+    return str(getattr(kumo_relational_client, "__version__", ""))
+
+
 def _cache_key(
     connectors: list[Any],
     relevant_tables: list[dict[str, Any]],
@@ -690,8 +979,15 @@ def _cache_key(
     connector = _connector_identity(connectors)
     if connector is None:
         return None
-    import kumo_relational_client
 
+    # The cached context carries the model handle, so the two backends must not
+    # share an entry: switching KUMO_*_API_URL would otherwise serve a handle
+    # that talks to the other endpoint.
+    url = hosted_url()
+    if url:
+        backend = f"hosted@{url}"
+    else:
+        backend = f"nim@{_engine_version()}"
     return CacheKey(
         connector=connector,
         database=next(iter(databases)),
@@ -703,7 +999,7 @@ def _cache_key(
         schema_fingerprint=catalog_fingerprint(relevant_tables),
         join_fingerprint=join_fingerprint(join_paths),
         prompt_version=PROMPT_VERSION,
-        engine_version=str(getattr(kumo_relational_client, "__version__", "")),
+        engine_version=backend,
     )
 
 
@@ -784,12 +1080,20 @@ def _build_context_within_budget(
     examples: list[dict[str, str]] | None,
 ) -> "PredictionContext | dict[str, Any]":
     """Read the tables and build the graph and model over them."""
-    import kumo_relational_client
-    from kumo_relational_client import relational as rfm
-
     from auto_ontology.retrieval.kumo.kumo_model import KumoModel, build_graph_context
 
-    client = _ensure_init()
+    # The hosted path resolves the PQL locally and posts a materialised task, so
+    # it needs neither the engine client nor the engine's graph: its graph is
+    # described straight from the frames (see framed_graph). That keeps the
+    # backend runnable on an image built without the ``kumo`` extra.
+    hosted: Any = None
+    client: Any = None
+    if hosted_enabled():
+        from auto_ontology.retrieval.kumo.hosted import HostedConfig
+
+        hosted = HostedConfig.from_env()
+    else:
+        client = _ensure_init()
 
     logger.info(
         "kumo: loading sample rows for %d relevant table(s)...",
@@ -797,13 +1101,11 @@ def _build_context_within_budget(
     )
     _load_start = time.perf_counter()
     spend = Spend(Budget.from_env())
-    frames, name_map, catalog_keys = _load_relevant_frames(
+    frames, name_map, catalog_keys, used_connectors = _load_relevant_frames(
         connectors, relevant_tables or [], spend
     )
     if not frames:
-        return _refused(
-            "No relevant tables were available to build a prediction graph."
-        )
+        return _refused("没有可用于构建预测图的相关表。")
     logger.info(
         "kumo: loaded %d frame(s) in %.2fs; building graph from %d table(s)",
         len(frames),
@@ -812,19 +1114,33 @@ def _build_context_within_budget(
     )
 
     _graph_start = time.perf_counter()
-    # Passing an explicit empty edge list suppresses LocalGraph's automatic
-    # relationship inference. This lets catalog join paths take precedence and
-    # avoids inferring the same links twice.
-    graph = rfm.Graph.from_data(
-        frames,
-        edges=[],
-        infer_metadata=True,
-        verbose=False,
-    )
-    logger.info(
-        "kumo: LocalGraph.from_data (metadata inferred) in %.2fs",
-        time.perf_counter() - _graph_start,
-    )
+    if hosted is not None:
+        from auto_ontology.retrieval.kumo.framed_graph import build_framed_graph
+
+        # No inference here: the frames already say what the columns are. Links are
+        # stated separately, once it is known whether the catalog supplied any.
+        graph: Any = build_framed_graph(frames, catalog_keys)
+        logger.info(
+            "kumo: framed graph described from %d table(s) in %.2fs",
+            len(frames),
+            time.perf_counter() - _graph_start,
+        )
+    else:
+        from kumo_relational_client import relational as rfm
+
+        # Passing an explicit empty edge list suppresses LocalGraph's automatic
+        # relationship inference. This lets catalog join paths take precedence and
+        # avoids inferring the same links twice.
+        graph = rfm.Graph.from_data(
+            frames,
+            edges=[],
+            infer_metadata=True,
+            verbose=False,
+        )
+        logger.info(
+            "kumo: LocalGraph.from_data (metadata inferred) in %.2fs",
+            time.perf_counter() - _graph_start,
+        )
     # Before any linking: an edge is oriented towards a primary key, so a table whose
     # key inference missed can take part in no relationship at all.
     spend.check_deadline("declaring keys")
@@ -832,7 +1148,7 @@ def _build_context_within_budget(
     covered = _apply_join_paths(graph, join_paths)
     if covered:
         logger.info("kumo: using %d catalog join edge(s)", covered)
-    else:
+    elif hosted is None:
         # No usable catalog join paths — fall back to KumoRFM's link heuristics.
         logger.info("kumo: no catalog join paths; inferring links heuristically")
         try:
@@ -842,11 +1158,29 @@ def _build_context_within_budget(
             logger.exception(
                 "kumo: infer_links failed; proceeding without inferred links"
             )
+    else:
+        from auto_ontology.retrieval.kumo.framed_graph import infer_links_by_name
+
+        inferred = infer_links_by_name(graph, frames)
+        logger.info(
+            "kumo: no catalog join paths; inferred %d link(s) by matching keys",
+            inferred,
+        )
 
     spend.check_deadline("building the graph")
     graph_ddl, edges, col_stypes, time_columns = build_graph_context(graph)
     spend.check_deadline("creating the model")
-    kumo_model = KumoModel(client.relational(graph), graph)
+    if hosted is not None:
+        from auto_ontology.retrieval.kumo.hosted import HostedKumoModel
+
+        kumo_model: Any = HostedKumoModel(graph, frames, hosted, col_stypes=col_stypes)
+        logger.info(
+            "kumo: hosted backend selected (%s), history anchors=%d",
+            hosted.url,
+            hosted.history_anchors,
+        )
+    else:
+        kumo_model = KumoModel(client.relational(graph), graph)
     entity_ids = _entity_ids(graph, frames)
 
     # Entity-selection SQL runs against the live Auto Ontology database connection (the
@@ -865,7 +1199,9 @@ def _build_context_within_budget(
         column_reference=build_column_reference(relevant_tables or [], col_stypes),
         identity=GraphIdentity(
             fingerprint=built_graph_fingerprint(graph),
-            engine_version=str(getattr(kumo_relational_client, "__version__", "")),
+            engine_version=(
+                f"hosted@{hosted.url}" if hosted is not None else _engine_version()
+            ),
             prompt_version=PROMPT_VERSION,
             tables=len(frames),
             rows=int(sum(len(frame) for frame in frames.values())),
@@ -875,6 +1211,7 @@ def _build_context_within_budget(
             build_seconds=round(time.perf_counter() - _load_start, 3),
             cache=CACHE_DISABLED,
         ),
+        table_connectors=used_connectors,
     )
 
 
@@ -931,4 +1268,4 @@ def _run_prediction(
     record.error = redact_error(str(getattr(result, "error", "") or ""))
     record.outcome = "answered" if getattr(result, "success", False) else "refused"
 
-    return _format_result(result)
+    return _format_result(result, context)

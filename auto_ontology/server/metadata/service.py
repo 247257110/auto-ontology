@@ -49,7 +49,7 @@ def _build_coverage_payload(
     """Assemble the payload for the entity-coverage pipeline."""
     connectors = get_connectors()
     if not connectors:
-        raise PredictionFlowError("No database connection is configured.")
+        raise PredictionFlowError("没有配置数据库连接。")
     custom_prompts = fetch_custom_prompts()
     return {
         "question": question,

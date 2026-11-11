@@ -248,7 +248,14 @@ _POSTGRES_DIALECT_RULES = (
     "- Postgres folds unquoted identifiers to lowercase. If a table or column name shown in "
     "AVAILABLE TABLES / KNOWN COLUMN MAPPINGS contains any uppercase letter, wrap it in double "
     "quotes using the EXACT case shown — leaving it unquoted silently resolves to the wrong "
-    "(lowercase) relation and errors as 'does not exist'. All-lowercase names need no quoting.\n\n"
+    "(lowercase) relation and errors as 'does not exist'. All-lowercase names need no quoting.\n"
+    "- Date arithmetic: subtracting two dates ALREADY returns an integer number of days, so "
+    "write `(CURRENT_DATE - last_order_date)` and use it as-is. There is no TO_DAYS() and no "
+    "DATEDIFF(). `EXTRACT(DAY FROM date - date)` also fails — the subtraction is an integer by "
+    "then, and EXTRACT rejects integers ('function pg_catalog.extract(unknown, integer) does "
+    "not exist'). Never wrap a date difference in EXTRACT; reserve EXTRACT/date_part for pulling "
+    "a field out of a single date. For whole months use "
+    "`EXTRACT(YEAR FROM AGE(now(), col)) * 12 + EXTRACT(MONTH FROM AGE(now(), col))`.\n\n"
 )
 
 
@@ -291,14 +298,20 @@ _SQL_GENERATION_OUTPUT_SPEC = """Output (fill fields in this exact order):
   state the choice AND the reason ("X, because Y"): zero/missing values
   (included, excluded, or coerced to 0; how division guards a zero
   denominator), and ties (what breaks a tie in a ranking/superlative
-  query).
-- sql_code: the complete SQL, no comments or delimiters.
-- response: 2-4 sentences for the end user, in plain English. Describe WHAT is
-  being calculated, WHICH tables and columns are used, any FILTERS or time
-  windows applied, and the GROUPING/ORDERING.
+  query). Write this field in Simplified Chinese (简体中文) — it is shown
+  verbatim as the "thinking" line in a Chinese-language chat UI.
+- sql_code: the complete SQL, no comments or delimiters. SQL is never
+  translated: keywords, identifiers and literals stay exactly as the dialect
+  needs them.
+- response: 2-4 sentences for the end user, in Simplified Chinese (简体中文).
+  Describe WHAT is being calculated, WHICH tables and columns are used, any
+  FILTERS or time windows applied, and the GROUPING/ORDERING.
   Do NOT include SQL and code fences, raw identifiers like ``schema.table``,
   or meta-commentary about your reasoning. Refer to tables
   and columns by their human-readable names.
+  Only the prose is Chinese: keep table names, column names, code, and any
+  value quoted from the data exactly as they appear — never translate or
+  transliterate them, and never restate their casing.
 - All fields are required."""
 
 
@@ -471,19 +484,16 @@ ORDER BY total_sales DESC;"""
 Example:
 
 thought:
-Join sales and customers, filter last full quarter, aggregate by country.
-"Total sales" means gross SUM(sales_amount), with no refund adjustment
-since the question didn't ask for one.
+关联 sales 与 customers，筛选上一个完整季度，按国家聚合。
+"总销售额"取 SUM(sales_amount) 的总额，不做退款冲减，因为问题没有要求。
 
 sql_code:
 {example_sql}
 
 response:
-This calculates total sales revenue per country for the most recently completed
-calendar quarter. It combines the sales records with the customers list so each
-sale is attributed to a country, sums the sales amounts within that quarter,
-and then groups the results by country and orders them from highest to lowest
-total sales.
+这个查询统计最近一个完整自然季度内各国的总销售额。它把销售记录与客户表
+关联起来，让每笔销售都能归到对应国家，再汇总该季度内的销售金额，最后按
+国家分组并按总销售额从高到低排序。
 """
 
 
@@ -534,7 +544,9 @@ Otherwise, construct an optimized SQL query to answer the question.
 {_SQL_GENERATION_OUTPUT_SPEC}
 
 Do NOT mention corrected errors.
-Do NOT force a match if the tables are not relevant to the question."""
+Do NOT force a match if the tables are not relevant to the question.
+Write ``thought`` in Simplified Chinese (简体中文): it is shown verbatim as the
+thinking line in a Chinese chat UI."""
 
 
 INTENT_VALIDATION_SYSTEM_PROMPT = """You are a SQL
@@ -1031,7 +1043,9 @@ If DOMAIN-SPECIFIC CUSTOM ANALYSES are listed above, treat their SQL as intentio
 definitions — do not flag the generated query as invalid merely for following those \
 patterns.{authoritative_note}
 
-Provide your analysis."""
+Provide your analysis. Write the reasoning field in Simplified Chinese (简体中文) — it is
+shown verbatim as the thinking line in a Chinese chat UI; keep any quoted SQL, identifiers
+and error text exactly as they are."""
 
 
 def create_entity_extraction_prompt(question: str) -> str:
@@ -1144,9 +1158,10 @@ Rules:
 Candidate tables:
 {tables_summary}
 
-Provide brief reasoning (1-2 sentences), then for each table you want REMOVED
-give its name together with both removal checks: whether it supplies no column
-the answer needs, and whether removing it cannot change which rows qualify.
+Provide brief reasoning (1-2 sentences) in Simplified Chinese (简体中文) — it is
+shown verbatim as the thinking line in a Chinese chat UI. Then, for each table you
+want REMOVED, give its name together with both removal checks: whether it supplies
+no column the answer needs, and whether removing it cannot change which rows qualify.
 State in its justification how you verified the row-scoping check.
 Only remove a table if you are confident it is not needed. When in doubt, do NOT remove."""
 

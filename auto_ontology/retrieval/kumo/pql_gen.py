@@ -26,6 +26,8 @@ Differences from SQL generation:
 from __future__ import annotations
 
 import logging
+import numbers
+import os
 import re
 import time
 from collections.abc import Callable
@@ -62,6 +64,28 @@ def _sql_table(table: str, table_names: dict[str, str] | None) -> str:
         if qualified is not None:
             return qualified
     return quote_ident(table)
+
+
+def sql_literal(value: Any) -> str | None:
+    """Render a value as a SQL literal, or ``None`` when it is not safe to.
+
+    These are keys read back from the warehouse, not text a caller supplied, so
+    the only job here is to keep a quote or a NUL from ending the literal early.
+    Anything else (a timestamp, a blob) is skipped rather than guessed at.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, numbers.Integral):
+        return str(int(value))
+    if isinstance(value, numbers.Real):
+        return repr(float(value))
+    if not isinstance(value, str):
+        return None
+    if not value or "\x00" in value:
+        return None
+    # A backslash is an escape character on some engines and a plain character on
+    # others; doubling it keeps the read from matching a *different* value there.
+    return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
 
 
 _FROM_JOIN_RE = re.compile(r'\b(FROM|JOIN)\s+"?([A-Za-z_]\w*)"?', re.IGNORECASE)
@@ -619,10 +643,30 @@ def _is_context_size_limit_error(message: str) -> bool:
 # source by the LIST_DISTINCT string-dtype compatibility shim in kumo_client, so recommendations now run.
 _UNSUPPORTED_SHAPE_MARKERS = ("device-side assert",)
 
+# The hosted endpoint's ceiling on how many distinct values one column may carry. The client already
+# narrows the request down to fit (hosted.py swallows back the offenders and retries), so reaching here
+# means the shape is still too wide afterwards. Regenerating a similar PQL cannot shrink a table, and a
+# retry sends the identical body, so this must not consume the repair budget.
+_CARDINALITY_MARKERS = ("categorical cardinality",)
+
 
 def _is_unsupported_shape_error(message: str) -> bool:
     """True if a predict error is a deterministic, unrecoverable 'this shape is not serveable' failure."""
     return any(marker in message.lower() for marker in _UNSUPPORTED_SHAPE_MARKERS)
+
+
+def _is_cardinality_shape_error(message: str) -> bool:
+    """True for the endpoint's 'categorical cardinality N exceeds limit M' shape rejection."""
+    return any(marker in message.lower() for marker in _CARDINALITY_MARKERS)
+
+
+def _friendly_cardinality_message(raw_error: str) -> str:
+    """User-facing explanation for a request that stays too wide after the client narrowed it."""
+    return (
+        "The prediction service caps how many distinct values a single column may hold (10,000) and this "
+        "table still exceeds it after the widest columns were left out. Narrow the question to fewer "
+        f"columns or a coarser grain, or ask it as SQL instead. Backend detail: {raw_error[:240]}"
+    )
 
 
 def _is_empty_context_error(message: str) -> bool:
@@ -1041,6 +1085,61 @@ def extract_entity_sql(text: str) -> str | None:
     return None
 
 
+# The entity-selection block decides how many entities get scored, and every
+# number in the answer is relative to that population -- so it cannot be left to
+# the model's discretion. Asked the same churn question twice, it emitted no
+# block once (568 customers scored) and once emitted
+#     SELECT customer_id FROM customers
+#     WHERE industry IN ('食品加工', '连锁餐饮', ...)
+# with a filter the question never mentioned (526 scored). Same question, a
+# different denominator, a different ranking.
+#
+# The block is model prose, so it is believed only when the question itself
+# accounts for it: some value or column it filters on is named in the question.
+# A subset the PQL already declares in its own ``FOR EACH ... WHERE`` is honoured
+# too -- there the scope is stated in the grammar rather than improvised.
+_FOR_EACH_WHERE_RE = re.compile(r"(?is)\bFOR\s+EACH\b[^;]*?\bWHERE\b")
+_ENTITY_SCOPE_STRING_RE = re.compile(r"'((?:[^']|'')*)'")
+_ENTITY_SCOPE_COLUMN_RE = re.compile(
+    r"(?i)\b([A-Za-z_]\w*)\s*(?:=|<>|!=|>=|<=|>|<|\bIN\b|\bLIKE\b|\bBETWEEN\b)"
+)
+_SQL_COMMENT_RE = re.compile(r"--[^\n]*|/\*.*?\*/", re.DOTALL)
+
+
+def drop_unasked_entity_scope(
+    entity_sql: str | None, question: str, pql: str = ""
+) -> str | None:
+    """Drop an entity-selection block that the question gives no ground for.
+
+    Keeping it would silently rescale the answer to a population the user never
+    asked about; dropping it scores everyone, which is what an unscoped question
+    means. Comments are stripped first: the model annotates its own SQL
+    (``-- example subset filter; omit if scoring all customers``), and that prose
+    must not count as grounding for the filter next to it.
+    """
+    if not entity_sql:
+        return entity_sql
+    if _FOR_EACH_WHERE_RE.search(pql or ""):
+        return entity_sql
+    body = _SQL_COMMENT_RE.sub(" ", entity_sql)
+    asked = (question or "").casefold()
+    for literal in _ENTITY_SCOPE_STRING_RE.findall(body):
+        value = literal.replace("''", "'").strip().casefold()
+        # One-letter values match half of any sentence; a filter worth honouring
+        # names something a reader would recognise.
+        if len(value) > 1 and value in asked:
+            return entity_sql
+    for column in _ENTITY_SCOPE_COLUMN_RE.findall(body):
+        if column.casefold() in asked:
+            return entity_sql
+    logger.info(
+        "Ignoring an entity-selection block the question does not ask for "
+        "(it filters on nothing the question names): %s",
+        " ".join(entity_sql.split())[:300],
+    )
+    return None
+
+
 def parse_entity(pql: str) -> tuple[str, str] | None:
     """Parse the entity from population and single-entity PQL ``FOR`` clauses."""
     match = _FOR_ENTITY.search(pql)
@@ -1225,6 +1324,197 @@ def _resolve_indices(
     return ids, population
 
 
+# A "will this entity go silent" question — ``COUNT(events.*, 0, N, days) = 0`` —
+# is answered by the absence of activity. An entity that has no row in ``events``
+# at all satisfies it for the wrong reason: it never started, so it never went
+# quiet. Those entities (signed-up leads that never converted, an account that
+# was never opened) then top every ranking of "most at-risk", and each one spends
+# a slot that a real customer needed.
+#
+# The exclusion is read from the data, not from a truth table: an entity with no
+# row in the very table the condition counts is the definition of never-started.
+# Nothing else is dropped — for ``> 0`` targets the same entity is a legitimate
+# negative, so those questions keep their full population.
+_ENV_NEVER_ACTIVE = "KUMO_NEVER_ACTIVE_FILTER"
+_NEVER_ACTIVE_CHUNK = 500
+
+
+def _never_active_enabled() -> bool:
+    """Whether never-active entities are dropped. ``KUMO_NEVER_ACTIVE_FILTER=0`` keeps them."""
+    return os.environ.get(_ENV_NEVER_ACTIVE, "1").strip().casefold() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _silence_target(
+    pql: str, col_stypes: dict[str, dict[str, str]] | None
+) -> tuple[str, str] | None:
+    """``(child table, entity table)`` when the target asks for the absence of activity.
+
+    Narrow on purpose: only a windowed aggregation compared to zero qualifies. A
+    threshold like ``>= 3`` asks about volume, and an entity with no history is a
+    plain miss there rather than a misread silence.
+    """
+    from auto_ontology.retrieval.kumo.pql_compile import PqlCompileError, compile_pql
+
+    try:
+        spec = compile_pql(pql, col_stypes=col_stypes)
+    except PqlCompileError:
+        return None
+    target = spec.target
+    if not target.is_aggregation or target.op is None or not target.table:
+        return None
+    if target.op not in {"=", "<=", "<"}:
+        return None
+    try:
+        threshold = float(str(target.literal).strip())
+    except (TypeError, ValueError):
+        return None
+    if threshold != 0:
+        return None
+    child = str(target.table)
+    if child.casefold() == spec.entity_table.casefold():
+        return None
+    return child, spec.entity_table
+
+
+def _history_foreign_key(
+    graph_edges: list[tuple[str, str, str]] | None, child: str, entity: str
+) -> str | None:
+    """The column on *child* that points at *entity*, as the graph states it.
+
+    Read from the edges rather than guessed from column names: linking the wrong
+    column would drop live entities, which is worse than not filtering at all.
+    A composite key is left alone — the edge names a surrogate column, and the
+    matching keys are not a single value.
+    """
+    for src, fkey, dst in graph_edges or []:
+        if (
+            str(src).casefold() == child.casefold()
+            and str(dst).casefold() == entity.casefold()
+        ):
+            name = str(fkey)
+            if name and "," not in name:
+                return name
+    return None
+
+
+def _drop_never_active(
+    ids: list[Any], *, connector: SQLDatabase, child_source: str, fkey: str
+) -> tuple[list[Any], int]:
+    """Drop the keys with no row at all in *child_source*.
+
+    Fails open: a read that errors, or that would remove every entity, leaves the
+    population as it was. Losing the whole answer to a cosmetic filter is a much
+    worse outcome than listing a lead.
+    """
+    if not ids:
+        return ids, 0
+    present: set[str] = set()
+    try:
+        for start in range(0, len(ids), _NEVER_ACTIVE_CHUNK):
+            chunk = [
+                literal
+                for literal in (
+                    sql_literal(value)
+                    for value in ids[start : start + _NEVER_ACTIVE_CHUNK]
+                )
+                if literal
+            ]
+            if not chunk:
+                continue
+            df = connector.execute(
+                f"SELECT DISTINCT {quote_ident(fkey)} FROM {child_source} "
+                f"WHERE {quote_ident(fkey)} IN ({', '.join(chunk)})"
+            )
+            if df is not None and not df.empty:
+                present.update(str(value) for value in df.iloc[:, 0].dropna())
+    except Exception:  # noqa: BLE001 - a filter that cannot read is not a filter
+        logger.info(
+            "Could not read %s to find never-active entities; keeping every entity.",
+            child_source,
+            exc_info=True,
+        )
+        return ids, 0
+    kept = [value for value in ids if str(value) in present]
+    if not kept:
+        logger.info(
+            "Every entity is missing from %s; that cannot be right, so none were dropped.",
+            child_source,
+        )
+        return ids, 0
+    return kept, len(ids) - len(kept)
+
+
+def _resolve_population(
+    pql: str,
+    entity_sql: str | None,
+    connector: SQLDatabase,
+    max_entities: int,
+    table_names: dict[str, str] | None = None,
+    available_entity_ids: dict[str, list[Any]] | None = None,
+    *,
+    graph_edges: list[tuple[str, str, str]] | None = None,
+    col_stypes: dict[str, dict[str, str]] | None = None,
+) -> tuple[list[Any], int, str | None]:
+    """:func:`_resolve_indices`, minus the entities that never started.
+
+    Returns ``(indices, population, note)``. The note is ``None`` unless entities
+    were actually dropped: an answer whose population is narrower than the
+    question implies has to say so.
+    """
+    ids, population = _resolve_indices(
+        pql,
+        entity_sql,
+        connector,
+        max_entities,
+        table_names,
+        available_entity_ids,
+    )
+    if entity_sql:
+        # A model-authored entity filter silently shrinks the population, and a
+        # ranking over 168 customers answers a different question than one over
+        # 600. Log it so the number in the answer can be traced to a cause.
+        logger.info(
+            "Entity population scoped by generated SQL (%d entit(ies)): %s",
+            len(ids),
+            " ".join(str(entity_sql).split())[:400],
+        )
+    if not ids or not graph_edges or not _never_active_enabled():
+        return ids, population, None
+    target = _silence_target(pql, col_stypes)
+    if target is None:
+        return ids, population, None
+    child, entity = target
+    fkey = _history_foreign_key(graph_edges, child, entity)
+    if fkey is None:
+        return ids, population, None
+    child_source = _sql_table(child, table_names)
+    kept, dropped = _drop_never_active(
+        ids, connector=connector, child_source=child_source, fkey=fkey
+    )
+    if not dropped:
+        return ids, population, None
+    logger.info(
+        "Excluded %d %s never seen in %s (never active, not silent); %d entit(ies) remain.",
+        dropped,
+        entity,
+        child,
+        len(kept),
+    )
+    note = (
+        f"已排除 {dropped:,} 个从未在 {child} 里出现过任何记录的对象："
+        "它们在「窗口内没有活动」这个条件上天然成立，但不是流失，而是从未开始。"
+        "混在排名里，每一个都会占掉一个真正需要干预的名额。"
+    )
+    # The population that was capped before this filter ran may include entities
+    # the scan never reached, so only subtract what was actually removed.
+    return kept, max(population - dropped, len(kept)), note
+
+
 def _persist_full_prediction(
     prediction: Any,
     *,
@@ -1363,9 +1653,8 @@ def _stale_anchor_note(anchor: Any, *, now: Any = None) -> str | None:
     if behind <= _STALE_ANCHOR_DAYS:
         return None
     return (
-        f"This prediction is anchored at {anchored.date()}, {behind:,} days ago, "
-        f"because that is as far as the data reaches. It is a forecast from that "
-        f"date, not from today."
+        f"这次预测锚定在 {anchored.date()}，也就是 {behind:,} 天前 —— "
+        f"因为数据只到这里。它是以那一天为起点做的预测，不是从今天起算的。"
     )
 
 
@@ -1438,6 +1727,14 @@ _GENERIC_ENTITY_FILTER_RE = re.compile(
 )
 _GENERIC_ENTITY_TYPE_COLUMNS = {"customer_type", "account_type", "entity_type", "type"}
 
+# ``PREDICT <target> [RANK TOP k] FOR EACH ...`` — the target ends where RANK or
+# FOR EACH begins, and it may wrap onto the next line.
+_RANK_TOP_RE = re.compile(r"[ \t]*\bRANK\s+TOP\s+\d+[ \t]*\n?", re.IGNORECASE)
+_PREDICT_TARGET_RE = re.compile(
+    r"\bPREDICT\s+(?P<target>.+?)(?=\s+(?:RANK|FOR)\b)",
+    re.IGNORECASE | re.DOTALL,
+)
+
 
 def _strip_unasked_generic_entity_filter(pql: str, question: str) -> str:
     """Remove inferred entity-type filters when the user asked for the whole population.
@@ -1462,6 +1759,63 @@ def _strip_unasked_generic_entity_filter(pql: str, question: str) -> str:
         + match.group("tail")
         + pql[match.end() :]
     )
+
+
+def drop_unrankable_top_k(
+    pql: str, col_stypes: dict[str, dict[str, str]] | None = None
+) -> str:
+    """Remove ``RANK TOP k`` from a target that cannot be ranked.
+
+    The prompt tells the model repeatedly that ``RANK TOP`` belongs to link
+    prediction and multi-class targets only, and it still appends it whenever the
+    question says "top 20" — then the backend refuses the whole prediction with
+    *"RANK TOP only applies to a link prediction (LIST_DISTINCT) or a multi-class
+    column target"*. That refusal arrives after the graph is built, so the user
+    pays the expensive part and gets nothing.
+
+    The request "top 20" is a presentation concern: a prediction scores every
+    entity, and the formatter orders by that score anyway. So dropping the clause
+    loses no information — it turns a hard failure into the answer the user asked
+    for. Removing it here is deterministic, which the prompt is not.
+
+    A bare column target is kept: it *may* be multi-categorical, and ranking those
+    is legitimate. Only an aggregate or a comparison (``COUNT(...) = 0``) is
+    unambiguously rank-free.
+    """
+    match = _RANK_TOP_RE.search(pql)
+    if not match:
+        return pql
+
+    # Match against the whole statement: the target ends at the RANK/FOR lookahead,
+    # which by definition is not inside the part before it.
+    target = _PREDICT_TARGET_RE.search(pql)
+    if target is None:
+        return pql
+    expression = target.group("target").strip()
+    upper = expression.upper()
+    if "LIST_DISTINCT" in upper:
+        return pql
+
+    unrankable = "(" in expression or "=" in expression
+    if not unrankable and col_stypes:
+        column = expression.rsplit(".", 1)[-1].strip('" ')
+        for table_columns in col_stypes.values():
+            stype = str(table_columns.get(column, "")).upper()
+            if stype:
+                unrankable = not any(marker in stype for marker in ("CATEGOR", "MULTI"))
+                break
+    if not unrankable:
+        return pql
+
+    logger.info("PQL: dropped RANK TOP from a target it cannot rank: %s", expression)
+    before, after = pql[: match.start()], pql[match.end() :]
+    # The pattern eats the whitespace on *both* sides of the clause, so joining the
+    # halves blindly welds the neighbours together: ``= 0 RANK TOP 20 FOR EACH``
+    # becomes ``= 0FOR EACH`` and the backend answers "No FOR EACH found" — a
+    # failure this function was supposed to prevent. Keep exactly one separator.
+    if before and after and not before[-1].isspace() and not after[0].isspace():
+        before += " "
+    return before + after
 
 
 def predict_all(
@@ -1548,6 +1902,10 @@ def generate_pql(
     result = PqlGenerationResult(question=question)
     prev_pql: str | None = None
     prev_error: str | None = None
+    # Notes are written per attempt, and a retry re-derives them from its own PQL.
+    # Without this the caller sees one note per attempt that ran — a failed try's
+    # anchor date alongside the successful one's.
+    base_note = result.note
     # Shared across every attempt of this run so the backoff ladder is not re-walked from
     # the full neighbourhood each time (see _NeighbourhoodMemo).
     neighbourhood_memo = _NeighbourhoodMemo()
@@ -1577,6 +1935,7 @@ def generate_pql(
             dialect=dialect,
         )
         result.attempts = attempt
+        result.note = base_note
         try:
             raw = invoke_text(active_llm, prompt)
         except Exception as exc:  # noqa: BLE001 - LLM/gateway failure: record and retry, never crash the run
@@ -1611,7 +1970,10 @@ def generate_pql(
             schema_text="\n".join([graph_ddl, column_reference, *docs]),
         )
         pql = _strip_unasked_generic_entity_filter(pql, question)
-        entity_sql = extract_entity_sql(raw)
+        # "top 20" in a question makes the model bolt RANK TOP onto a binary
+        # target, which the backend refuses only after the graph is built.
+        pql = drop_unrankable_top_k(pql, graph_col_stypes)
+        entity_sql = drop_unasked_entity_scope(extract_entity_sql(raw), question, pql)
         if explain and explain_entity:
             pql = _scope_explain_entity(pql, explain_entity)
         result.pql = pql
@@ -1687,19 +2049,22 @@ def generate_pql(
                     scope_sql = None
                     if re.search(r"\b(WHERE|LIMIT)\b", entity_sql, re.IGNORECASE):
                         result.note = (
-                            "A grouped breakdown scores every entity and aggregates by "
-                            f"'{group_by}', so the planner's entity filter was not applied — these totals "
-                            "cover the whole population. Ask without grouping to filter a sub-population."
+                            "按组分组的明细会对每个实体打分后按 "
+                            f"'{group_by}' 汇总，因此查询里设置的实体筛选条件没有生效 —— "
+                            "这些合计覆盖的是全量。若只想看某个子集，请去掉分组再问。"
                         )
                     result.entity_sql = None
-                indices, population = _resolve_indices(
+                indices, population, scope_note = _resolve_population(
                     pql,
                     scope_sql,
                     connector,
                     entity_cap,
                     table_names,
                     available_entity_ids,
+                    graph_edges=graph_edges,
+                    col_stypes=graph_col_stypes,
                 )
+                result.note = _join_notes(result.note, scope_note)
                 if whole_population and population > entity_cap:
                     raise PqlPopulationTooLargeError(
                         _population_refusal(pql, population, entity_cap)
@@ -1709,15 +2074,14 @@ def generate_pql(
                         parsed = parse_entity(pql)
                         entity_table = parsed[0] if parsed else "entity"
                         result.note = (
-                            f"LIMITATION: KumoRFM forecasts a multi-period time series for ONE {entity_table} at "
-                            f"a time, so a month-by-month forecast for ALL {entity_table}s in one run is not "
-                            f"supported. It supports EITHER (a) a multi-horizon forecast for a single "
-                            f"{entity_table}, OR (b) a single-horizon prediction across all {entity_table}s. "
-                            f"{len(indices)} {entity_table}s matched; shown below is the multi-period forecast "
-                            f"for just one ({indices[0]}). To cover the whole population, run a single-horizon "
-                            f"prediction across all {entity_table}s first, then a multi-horizon forecast for the "
-                            f"few {entity_table}s of interest (one at a time). Tell the user both options and ask "
-                            f"which they want — do NOT imply the all-entity month-by-month result was produced."
+                            f"限制：KumoRFM 一次只能对单个 {entity_table} 做多期时间序列预测，"
+                            f"所以无法在一次运行里给出全部 {entity_table} 的逐月预测。"
+                            f"它支持的两种方式是：(a) 对单个 {entity_table} 做多跨度预测，"
+                            f"或 (b) 对全部 {entity_table} 做单跨度预测。"
+                            f"本次匹配到 {len(indices)} 个 {entity_table}，下面只展示其中一个"
+                            f"（{indices[0]}）的多期预测。"
+                            f"如需覆盖全量，可以先对全部 {entity_table} 做单跨度预测，"
+                            f"再对关注的少数 {entity_table} 逐个做多期预测。"
                         )
                     indices = indices[:1]
 
@@ -1810,6 +2174,14 @@ def generate_pql(
             logger.info(
                 "PQL attempt %d/%d failed: %s", attempt, max_tries, prev_error[:160]
             )
+            if _is_cardinality_shape_error(prev_error):
+                # The client already dropped the widest columns; a regenerated PQL would be
+                # rejected by the same ceiling, so report instead of spending the remaining attempts.
+                result.error = _friendly_cardinality_message(prev_error)
+                logger.info(
+                    "Categorical cardinality over the endpoint ceiling after narrowing; not regenerating."
+                )
+                break
             if _is_unsupported_shape_error(prev_error):
                 if _is_existence_count_pql(pql):
                     result.error = _friendly_unsupported_message(pql, prev_error)

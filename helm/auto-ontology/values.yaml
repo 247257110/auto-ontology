@@ -47,12 +47,22 @@ defaultModelsModel: ""
 nvidiaApiKey: ""
 baseUrl: ""
 modelName: ""
-# KumoRFM (predictions). Set the URL to a Universal TFM NIM serving the
-# 'kumo-rfm' model; leave it empty to disable the prediction tool. NIMs are
-# unauthenticated by contract, so the key is only needed when a deployment
-# fronts the NIM with an authenticating gateway.
+# KumoRFM (predictions). Set either URL to enable the prediction tool; leaving
+# both empty disables it. kumoRfmApiUrl names a self-hosted Universal TFM NIM
+# serving the 'kumo-relational' model and resolves the PQL on that host; NIMs are
+# unauthenticated by contract, so kumoRfmApiKey is only needed when a gateway
+# fronts the NIM. kumoHostedApiUrl names the hosted endpoint on build.nvidia.com
+# (the value 'public' selects it), which uploads the sampled rows and therefore
+# requires kumoHostedApiKey.
 kumoRfmApiKey: ""
 kumoRfmApiUrl: ""
+kumoHostedApiKey: ""
+kumoHostedApiUrl: ""
+# Shaping for the hosted backend: historical anchors per context instance,
+# entities scored per request, and event rows sent per instance.
+kumoHistoryAnchors: ""
+kumoMaxInstances: ""
+kumoMaxRelatedRows: ""
 # Embedding endpoint/model. Leave empty to inherit from the default triplet /
 # auto-derive from the API key prefix; set to override just the embedder.
 embedEndpoint: ""
