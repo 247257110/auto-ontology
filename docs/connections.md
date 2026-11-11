@@ -39,6 +39,24 @@ A comma- or newline-separated list of connection URLs supplied at deploy time
 (`.env` for Docker Compose, `--set connectionStrings=...` for Helm). It carries
 no schema or table filters. `GET /api/connections/source` reports whether it is set.
 
+### `SOURCE_CONNECTION_STRINGS` (Docker Compose)
+
+`localhost` is the host in one place and the container itself in another, so a
+single `.env` cannot serve both a Compose stack and host-side `uv run` without
+editing it. Compose therefore reads a container-facing override:
+
+- `SOURCE_CONNECTION_STRINGS` — what the containers actually get. Inside the
+  Compose network the bundled database is the service name `postgres`, so this
+  URL must be `...@postgres:5432/...`.
+- `CONNECTION_STRINGS` — the host-side value (`127.0.0.1`), used by `uv run` and
+  `dev_tools/`.
+
+`docker-compose.yml` injects `CONNECTION_STRINGS: ${SOURCE_CONNECTION_STRINGS:-${CONNECTION_STRINGS:-}}`
+into `auto-ontology` and `ingestion-service`, so the fallback keeps
+single-path setups working. A `@localhost` source URL in a Compose deployment
+fails as `connection to server at "::1", port 5432 failed: Connection refused`
+— the container dialing its own loopback.
+
 The URL scheme selects the connector:
 
 | Engine        | Scheme                      | Add in the UI |

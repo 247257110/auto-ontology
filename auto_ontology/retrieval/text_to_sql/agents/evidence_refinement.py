@@ -121,13 +121,23 @@ Preserve every scalar value, operator, formula, arithmetic expression, filter,
 grouping, ordering, projection, and unrelated word exactly. Explicit
 quoted/backticked column names in evidence are authoritative and must map to that
 exact catalog column, never to a semantically similar column. If an
-evidence-described field is uncertain, leave it unchanged."""
+evidence-described field is uncertain, leave it unchanged.
+
+Write the reasoning field in Simplified Chinese (简体中文): it is shown verbatim
+as the thinking line in a Chinese chat UI. Keep identifiers, quoted columns and
+evidence text exactly as they are — only the reasoning is Chinese."""
 
 
 class EvidenceGroundingResult(StrictLLMOutputModel):
     """Structured schema-grounding response produced before value repair."""
 
-    reasoning: str = Field(default="")
+    reasoning: str = Field(
+        default="",
+        description=(
+            "Brief reasoning. Write this in Simplified Chinese (简体中文): it is "
+            "shown verbatim as the thinking line in a Chinese chat UI."
+        ),
+    )
     grounded_question: str = Field(
         description=(
             "Complete question with the minimal semantic phrase corresponding to "
@@ -174,7 +184,13 @@ class EvidenceLineRepair(StrictLLMOutputModel):
 class EvidenceRefinementResult(StrictLLMOutputModel):
     """Structured evidence refinement response."""
 
-    reasoning: str = Field(default="")
+    reasoning: str = Field(
+        default="",
+        description=(
+            "Brief reasoning. Write this in Simplified Chinese (简体中文): it is "
+            "shown verbatim as the thinking line in a Chinese chat UI."
+        ),
+    )
     repairs: list[EvidenceLineRepair] = Field(default_factory=list)
     corrected_question: str = Field(
         default="",

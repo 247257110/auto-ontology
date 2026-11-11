@@ -2,6 +2,18 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Source-database URLs, as seen from *inside* the compose network.
+#
+# `CONNECTION_STRINGS` in .env is shared with host-side development (`uv run`),
+# where `localhost` is correct. Inside a container `localhost` is the container
+# itself, so a `@localhost:5432` source URL fails with `connection to server at
+# "::1", port 5432 failed: Connection refused`. `SOURCE_CONNECTION_STRINGS` is
+# the Docker-facing override: set it (service name `postgres`) and every
+# container that needs a source DB gets that value instead, while .env keeps
+# whatever the host path needs. Unset or empty falls back to `CONNECTION_STRINGS`,
+# so single-host setups need not set both.
+x-source-connection-strings: &source-connection-strings "${SOURCE_CONNECTION_STRINGS:-${CONNECTION_STRINGS:-}}"
+
 services:
   postgres:
     image: pgvector/pgvector:pg17
@@ -52,6 +64,7 @@ services:
       # In-network port; POSTGRES_PORT in .env is the host-side mapping.
       POSTGRES_PORT: "5432"
       INGESTION_SERVICE_URL: http://ingestion-service:3002
+      CONNECTION_STRINGS: *source-connection-strings
     depends_on:
       postgres:
         condition: service_started
@@ -93,6 +106,9 @@ services:
     environment:
       POSTGRES_HOST: postgres
       POSTGRES_PORT: "5432"
+      # Ingestion always prefers CONNECTION_STRINGS when it is set, so it needs
+      # the same in-network override as the backend.
+      CONNECTION_STRINGS: *source-connection-strings
     depends_on:
       postgres:
         condition: service_started

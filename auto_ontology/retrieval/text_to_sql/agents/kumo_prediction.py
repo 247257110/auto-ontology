@@ -53,7 +53,7 @@ class KumoPredictionAgent(BaseAgent):
             # Only reached when prepare_prediction_graph signalled ready, so this
             # is a defensive guard rather than an expected path.
             final_response = _error_response(
-                "The prediction graph was not prepared for this question."
+                "这次预测所需的图还没准备好，无法给出预测结果。"
             )
         else:
             try:
@@ -61,8 +61,7 @@ class KumoPredictionAgent(BaseAgent):
             except Exception as exc:
                 self.logger.exception("KumoRFM prediction failed")
                 final_response = _error_response(
-                    "I couldn't produce a prediction for this question. "
-                    f"({type(exc).__name__}: {exc})"
+                    f"这次没能给出预测结果。（{type(exc).__name__}: {exc}）"
                 )
 
         markdown = final_response.get("response", "")

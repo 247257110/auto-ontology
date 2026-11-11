@@ -30,6 +30,11 @@ JSON.
 | `charts` | A chart or table for the result (`content`, `sql_response`). Sent after `result` when the query ran and the request includes a `conversation_id`. |
 | `error`  | A `message` describing why the run failed. |
 
+Two language rules hold across the stream: `thought`, `label` and `response` are
+Simplified Chinese, while `sql_code`, identifiers inside them and every value in
+`sql_response_from_db` are passed through exactly as produced or read from the
+database — nothing is translated, so rows can be compared with the source tables.
+
 A run makes many sequential model calls and typically takes tens of seconds, so
 read the stream as it arrives:
 
@@ -95,6 +100,37 @@ payloads, errors, and raw result rows stay out of it.
 Conversation history belongs to the authenticated user. An API-created
 conversation opens in the UI at `/chat?focus=<conversation_id>` for the user who
 owns it. The web UI manages its own conversation IDs.
+
+## Database scope
+
+`target_db` (catalog database UUID or name) scopes one turn to one database:
+every semantic search is filtered to it, the candidate-database vote never runs,
+and table selection and SQL execution use that database's connector. Omitting it
+leaves the scope to `CHAT_DEFAULT_TARGET_DB` (see below) or, when that is unset,
+to the vote.
+
+```json
+{
+  "question": "客户营收排名Top10",
+  "target_db": "wideworldimporters"
+}
+```
+
+With several connected databases that model the same business, the vote can only
+tie-break on hit count and then on database *name*, so a question about
+customers, orders, or revenue may be answered from the wrong library's fields.
+Two deployment settings pin each branch to the database that owns the question
+type:
+
+| Setting | Applies to | Why |
+|---|---|---|
+| `CHAT_DEFAULT_TARGET_DB` | every turn classified as information or calculation | Keeps SQL questions on the warehouse instead of whichever library wins the vote |
+| `CHAT_PREDICTION_TARGET_DB` | turns classified as prediction (`question_type = prediction`) | A forecast belongs to the library it was trained and scored against; left to the vote, a churn question lands on the warehouse and fails resolving `sales.customers` against the churn connection |
+
+Both pins are soft: a turn is left to the vote when the question names another
+connected database, e.g. `retail_churn 里 2024 年有多少客户`, so an explicit
+mention still wins without any request parameter. An explicit `target_db`
+always overrides both.
 
 ## Trust boundary
 

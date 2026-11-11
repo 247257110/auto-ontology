@@ -93,7 +93,10 @@ def test_announcing_outside_a_stream_is_not_fatal() -> None:
 
 
 def test_information_agent_has_a_streaming_label() -> None:
-    assert NODE_LABELS["information_agent"] == "Answering from metadata"
+    # Asserts the invariant (the node gets human-facing copy instead of falling
+    # back to its raw name), not the exact wording — re-translating the UI copy
+    # must not break this test.
+    assert NODE_LABELS["information_agent"] != "information_agent"
 
 
 def test_node_still_runs_when_announcing_fails(monkeypatch: Any) -> None:

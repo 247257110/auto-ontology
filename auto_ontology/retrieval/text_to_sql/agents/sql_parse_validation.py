@@ -95,7 +95,8 @@ class IntentValidationModel(BaseModel):
         default="",
         description=(
             "Brief reasoning (1-2 sentences max) on whether the SQL addresses "
-            "the question's intent."
+            "the question's intent. Write this in Simplified Chinese (简体中文): "
+            "it is shown verbatim as the thinking line in a Chinese chat UI."
         ),
     )
     is_valid: bool = Field(

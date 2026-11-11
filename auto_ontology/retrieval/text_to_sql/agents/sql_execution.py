@@ -33,10 +33,8 @@ logger = logging.getLogger(__name__)
 # stack trace, but "the question was fine, the connection was not" tells them
 # retrying is worthwhile and that nothing is wrong with how they asked.
 _INFRASTRUCTURE_MESSAGE = (
-    "I couldn't reach the database, so the query never ran. This is a "
-    "connection problem, not a problem with your question — please try again "
-    "in a moment. If it keeps happening, the database connection needs "
-    "attention."
+    "连不上数据库，查询没有执行。这是连接问题，不是你的问题写得不对 —— "
+    "请稍后重试；如果一直这样，需要检查数据库连接配置。"
 )
 
 # This agent's node name in the graph. ``stream_agent_response`` matches
@@ -254,7 +252,7 @@ class SQLExecutionAgent(BaseAgent):
             record_thought(
                 path_state,
                 _GRAPH_NODE_NAME,
-                "Query needs a rewrite before its result can be submitted.",
+                "这条查询需要先重写，才能提交结果。",
             )
             return {"decision": "invalid_sql", "path_state": path_state}
 
@@ -282,8 +280,7 @@ class SQLExecutionAgent(BaseAgent):
                 record_thought(
                     path_state,
                     _GRAPH_NODE_NAME,
-                    f"Couldn't reach the database: "
-                    f"{_short_error(response_from_db.error)}",
+                    f"无法连接数据库：{_short_error(response_from_db.error)}",
                 )
                 return {
                     "decision": "unconstructable",
@@ -299,7 +296,7 @@ class SQLExecutionAgent(BaseAgent):
             record_thought(
                 path_state,
                 _GRAPH_NODE_NAME,
-                f"Query failed, rewriting it: {_short_error(response_from_db.error)}",
+                f"查询执行失败，正在重写：{_short_error(response_from_db.error)}",
             )
             return {"decision": "invalid_sql", "path_state": path_state}
 

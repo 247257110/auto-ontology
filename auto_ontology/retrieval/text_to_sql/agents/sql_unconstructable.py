@@ -62,9 +62,7 @@ class SQLUnconstructableAgent(BaseAgent):
         unconstructable = path_state.get("unconstructable_explanation", "")
 
         response_text = (
-            unconstructable
-            if unconstructable
-            else "SQL can't be constructed from the data."
+            unconstructable if unconstructable else "无法用现有数据构造出这条 SQL。"
         )
 
         # Same keys as a successful answer so consumers (persistence, the chart

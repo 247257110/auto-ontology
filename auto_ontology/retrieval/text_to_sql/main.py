@@ -164,15 +164,16 @@ def _build_state(payload: TextToSQLPayload) -> AgentState:
     calculation_only = bool(payload.get("calculation_only", False))
 
     # ``prediction=True`` only means something when the KumoRFM branch was built
-    # into the graph at startup; without KUMO_RFM_API_KEY the classify node does
-    # not exist, so honouring the override is impossible. Fail loudly rather than
-    # silently answering with SQL. Calculation-only questions intentionally
-    # ignore this separate interactive-mode selector.
+    # into the graph at startup; without KUMO_RFM_API_URL or KUMO_HOSTED_API_URL
+    # the classify node does not exist, so honouring the override is impossible.
+    # Fail loudly rather than silently answering with SQL. Calculation-only
+    # questions intentionally ignore this separate interactive-mode selector.
     prediction_override = None if calculation_only else payload.get("prediction")
     if prediction_override is True and not _prediction_enabled():
         raise ValueError(
             "prediction=true was requested but the prediction flow is not "
-            "configured on this deployment (KUMO_RFM_API_KEY is unset)."
+            "configured on this deployment (neither KUMO_RFM_API_URL nor "
+            "KUMO_HOSTED_API_URL is set)."
         )
 
     initial_path_state = dict(payload.get("path_state") or {})
@@ -328,7 +329,9 @@ def _apply_last_deterministic_sql_fallback(
         final_response["sql_code"] = fallback_sql
     else:
         final_response = {
-            "response": str(final_response or "SQL intent validation was exhausted."),
+            "response": str(
+                final_response or "SQL 意图校验已经用尽重试次数，未能得到通过的查询。"
+            ),
             "sql_code": fallback_sql,
         }
     path_state["final_response"] = final_response
@@ -556,7 +559,7 @@ def get_agent_response(payload: TextToSQLPayload) -> dict:
                 node=event.get("node"),
                 partial_answer=event.get("partial_answer"),
             )
-    return {"response": "SQL can't be constructed.", "sql_code": "", "result": None}
+    return {"response": "无法构造出这条 SQL。", "sql_code": "", "result": None}
 
 
 def get_agent_response_with_state(payload: TextToSQLPayload) -> dict:
@@ -595,7 +598,7 @@ def get_agent_response_with_state(payload: TextToSQLPayload) -> dict:
         interrupted_path_state = final_state.get("path_state") or {}
         fallback_sql = interrupted_path_state.get("sql_code", "") or ""
         return {
-            "response": f"Agent failed: {exc}",
+            "response": f"执行失败：{exc}",
             "sql_code": fallback_sql,
             "path_state": interrupted_path_state,
         }
