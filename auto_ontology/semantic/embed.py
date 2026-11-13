@@ -13,6 +13,11 @@ from typing import Any
 from auto_ontology.utils.embedding import EmbedParams, batch_embed
 from auto_ontology.utils.model_config import resolve
 from auto_ontology.utils.sample_values import stringify_sample_values
+from auto_ontology.semantic.chinese import (
+    contains_cjk,
+    format_aliases,
+    normalize_chinese_text,
+)
 from auto_ontology.vdb import get_semantic_vdb
 from auto_ontology.vdb.postgres import PostgresVDB
 from auto_ontology.vdb.records import write_embedded_rows
@@ -221,7 +226,11 @@ def _build_rows(
 
     term_name = term.get("name")
     if term_name:
-        text = f"Term: {term_name}. {term.get('description') or ''}".strip()
+        description = normalize_chinese_text(str(term.get("description") or ""))
+        aliases = format_aliases(term.get("synonyms"))
+        text = f"Term: {term_name}. {description}".strip()
+        if aliases:
+            text += f" Aliases: {aliases}."
         path = f"semantic:term:{term_name}"
         fields: dict[str, Any] = {
             "label": "Term",
@@ -244,7 +253,8 @@ def _build_rows(
         )
 
     term_synonyms: list[str] = term.get("synonyms") or []
-    synonym_suffix = f" ({', '.join(term_synonyms)})" if term_synonyms else ""
+    normalized_synonyms = format_aliases(term_synonyms)
+    synonym_suffix = f" ({normalized_synonyms})" if normalized_synonyms else ""
 
     for a in attrs:
         attr_name = a.get("name")
@@ -257,12 +267,21 @@ def _build_rows(
         # The column's description, never the attribute's: the attribute's is
         # written after FK resolution from its links, and editing it must not
         # move the vector.
+        description = normalize_chinese_text(str(a.get("column_description") or ""))
         text = (
             f"ColumnAttribute: {attr_name} of Term {owner}{synonym_suffix}"
             f"{family_suffix}. "
-            f"{a.get('column_description') or ''}"
+            f"{description}"
             f"{sample_block}"
         ).strip()
+        physical_column = normalize_chinese_text(str(a.get("source_column") or ""))
+        table_name = normalize_chinese_text(str(a.get("table_name") or ""))
+        if physical_column and (
+            contains_cjk(physical_column) or contains_cjk(table_name)
+        ):
+            text += f" Physical column: {physical_column}."
+        if table_name and contains_cjk(table_name):
+            text += f" Table: {table_name}."
         path = (
             f"semantic:attr:{a['id']}"
             if a.get("id")

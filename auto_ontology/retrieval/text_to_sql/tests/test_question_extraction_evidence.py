@@ -52,6 +52,16 @@ def test_prompt_omits_evidence_section_when_not_provided(
     assert "## Evidence for sanitization" not in prompt
 
 
+def test_chinese_question_gets_language_guidance() -> None:
+    prompt = create_question_extraction_prompt(
+        "查询上个月的客户数量", include_subject=False
+    )
+
+    assert "## Chinese-language guidance" in prompt
+    assert "不要翻译" in prompt
+    assert "万/亿" in prompt
+
+
 def test_agent_forwards_state_evidence_without_changing_original_question(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

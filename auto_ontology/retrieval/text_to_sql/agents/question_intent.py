@@ -23,6 +23,7 @@ from auto_ontology.retrieval.text_to_sql.state import (
     AgentState,
     get_standalone_question,
 )
+from auto_ontology.semantic.chinese import contains_cjk
 from auto_ontology.utils.llm_invoke import (
     StrictLLMOutputModel,
     invoke_with_structured_output,
@@ -363,11 +364,24 @@ def create_question_intent_prompt(
 """
     )
 
+    language_section = ""
+    if contains_cjk(question):
+        language_section = """## Chinese-language guidance
+The question contains Chinese. Preserve Chinese business terms, abbreviations,
+numbers, units, and time expressions in rewritten_question. Do not translate
+business terms to English. Distinguish calendar periods such as 去年、上个月、
+本季度 from rolling windows such as 最近30天; keep the distinction explicit.
+中文业务术语不要翻译成英文。Do not treat Chinese measure words such as 家、笔、个、位
+as database entities.
+
+"""
+
     return f"""You prepare a question for a data agent.
 
 {tasks}
 {override_instruction}
 {question_types}
+{language_section}
 
 ## Calculation subtypes
 Use each SQL example only to understand the subtype's structural pattern. The

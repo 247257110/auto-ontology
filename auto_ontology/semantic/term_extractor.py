@@ -11,6 +11,7 @@ from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
+from auto_ontology.semantic.chinese import contains_cjk, normalize_chinese_text
 from auto_ontology.semantic.deterministic import _is_word_char, to_term_name
 from auto_ontology.semantic.domain import DomainSummary
 from auto_ontology.utils.llm_invoke import (
@@ -65,7 +66,10 @@ label with spaces between words (e.g. Order Date, Total Amount).
 5. If the table name contains a word that indicates it is a variant of another table \
 (e.g. ARC, ARCHIVE, HIST, HISTORY, STAGING, DELETED, TEMP), prefix every display_name \
 with a qualifying word derived from that suffix \
-(e.g. PEOPLE_ARC → "Archived Is Sales Person", ORDERS_HIST → "Historical Total Amount")."""
+(e.g. PEOPLE_ARC → "Archived Is Sales Person", ORDERS_HIST → "Historical Total Amount").
+6. When the source description or table name is Chinese, preserve Chinese business \
+terms and may return Chinese Term/display names. Do not translate Chinese names into \
+English or force English word spacing."""
 
 
 class _SynonymExtractionModel(BaseModel):
@@ -97,8 +101,12 @@ Do NOT infer, guess, or add any name that is not directly written in the descrip
 
 def _normalize_label(name: str, *, fallback: str) -> str:
     cleaned = unicodedata.normalize("NFC", name.strip())
-    if cleaned.lower() in _INVALID or not _is_display_label(cleaned):
+    if contains_cjk(cleaned):
+        cleaned = normalize_chinese_text(cleaned)
+    if cleaned.casefold() in _INVALID or not _is_display_label(cleaned):
         return fallback
+    if contains_cjk(cleaned):
+        return cleaned
     return to_term_name(cleaned)
 
 

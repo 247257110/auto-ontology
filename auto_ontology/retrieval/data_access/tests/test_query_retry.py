@@ -75,3 +75,34 @@ def test_a_bad_key_raises_at_once(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(AuthenticationError):
         _query_with_retry(retriever, "x", 3, None)
     assert len(retriever.outcomes) == 1
+
+
+def test_semantic_search_normalizes_full_width_query_before_embedding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[str] = []
+
+    class Vdb:
+        metadata_filter_format = "dict"
+
+    class Retriever:
+        vdb_kwargs = {"vdb": Vdb()}
+
+        def query(self, text: str, top_k: int, vdb_kwargs: Any) -> list[dict]:
+            captured.append(text)
+            return [
+                {
+                    "text": "hit",
+                    "_distance": 0.1,
+                    "metadata": {"id": "id-1", "label": "ColumnAttribute"},
+                }
+            ]
+
+    rows = semantic_search.search_semantic_index(
+        Retriever(),
+        "　客户　收入　",
+        label_filter=["ColumnAttribute"],
+    )
+
+    assert rows[0]["id"] == "id-1"
+    assert captured == ["客户 收入"]

@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Literal
 from auto_ontology.catalog.constants import Labels
 
 from auto_ontology.semantic.constants import LABEL_SQL_ATTRIBUTE
+from auto_ontology.semantic.chinese import normalize_chinese_text
 
 if TYPE_CHECKING:
     from auto_ontology.utils.retriever import Retriever
@@ -321,6 +322,7 @@ def search_semantic_index(
     plugged into the retriever — see :func:`_metadata_filter_format`.
     """
     fmt = _metadata_filter_format(retriever)
+    entity = normalize_chinese_text(entity)
 
     allowed_labels = {str(x) for x in (label_filter or []) if x is not None} or None
     labels_to_query = list(allowed_labels) if allowed_labels else [None]

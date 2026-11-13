@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 
+from auto_ontology.semantic.chinese import contains_cjk
+
 # Maximum number of entity noun phrases to extract per question during clarification.
 # Raise via CLARIFICATION_MAX_ENTITIES env var for complex multi-metric queries.
 # Falls back to SQL_GEN_MAX_ENTITIES (then 5) when unset.
@@ -214,11 +216,23 @@ def create_question_extraction_prompt(
         )
         trailing = ""
 
+    language_guidance = ""
+    if contains_cjk(question):
+        language_guidance = """## Chinese-language guidance
+
+The input contains Chinese. Preserve Chinese business terms, abbreviations, and
+qualifiers in sanitized_question. Do not translate them into English. Resolve
+aliases through the supplied Glossary, but do not invent a synonym. Treat
+Chinese measure words such as 位、家、笔、个 and 万/亿 as semantic quantity
+information rather than database entities. 中文业务术语不要翻译成英文。
+
+"""
+
     return f"""{intro}
 
 {_SANITIZE_AND_ENTITIES}
 {trailing}
-{glossary_section}{evidence_section}## Input
+{language_guidance}{glossary_section}{evidence_section}## Input
 
 {question}
 """

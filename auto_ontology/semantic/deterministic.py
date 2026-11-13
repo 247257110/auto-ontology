@@ -15,6 +15,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from auto_ontology.dal.datasources import store_column_descriptions
+from auto_ontology.semantic.chinese import contains_cjk, normalize_chinese_text
 from auto_ontology.semantic.date_format import is_date_type
 from auto_ontology.semantic.models import ColumnAttributeSpec, ColumnDescriptionResult
 from auto_ontology.utils.catalog_reembed import refresh_catalog_embeddings
@@ -75,7 +76,9 @@ def to_term_name(table_name: str) -> str:
     If nothing word-like remains, the stripped table name itself is returned,
     never an empty name.
     """
-    stripped = unicodedata.normalize("NFC", table_name.strip())
+    stripped = normalize_chinese_text(unicodedata.normalize("NFC", table_name.strip()))
+    if contains_cjk(stripped):
+        return stripped
     separated = re.sub(r"(?<=[A-Z])(?=[A-Z][a-z])", " ", stripped)
     separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", separated)
     name = " ".join(

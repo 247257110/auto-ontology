@@ -188,6 +188,15 @@ def test_prompt_requests_structural_sql_example_filtering() -> None:
     assert "2. Question: How many products exist?" in prompt
     assert "same requested output shape" in prompt
     assert "Different business subjects may still share a useful pattern" in prompt
+
+
+def test_chinese_prompt_preserves_business_terms_and_time_window_semantics() -> None:
+    prompt = create_question_intent_prompt("查询去年各地区的客户收入")
+
+    assert "## Chinese-language guidance" in prompt
+    assert "不要将业务术语翻译成英文" in prompt or "Do not translate" in prompt
+    assert "去年" in prompt
+    assert "最近30天" in prompt
     assert "Reject examples with a different aggregation" in prompt
 
 
