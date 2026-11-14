@@ -334,6 +334,7 @@ def update_term(
     name_certified: bool | None = None,
     description_certified: bool | None = None,
     owner_id: str | None = None,
+    synonyms: list[str] | None = None,
     set_owner: bool = False,
     modified_by: str | None = None,
     touch: bool = False,
@@ -374,6 +375,8 @@ def update_term(
             ),
             "owner_id": (literal(owner_id, String) if set_owner else s.term.c.owner_id),
         }
+        if synonyms is not None:
+            values["synonyms"] = synonyms
         # Only an edit from the app. Compilation calls this without ``touch``
         # and must not look like someone saved the term.
         if touch:

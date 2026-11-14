@@ -18,6 +18,7 @@ from auto_ontology.server.identity import resolve_internal_user
 from auto_ontology.server.owners import enforce_edit, owner_from_body
 from auto_ontology.server.pagination import LIMIT_QUERY, SKIP_QUERY
 from auto_ontology.server.terms import service as term_service
+from auto_ontology.semantic.chinese import normalize_aliases
 from auto_ontology.server.responses import (
     ColumnAttributePageResponse,
     ColumnAttributePatchResponse,
@@ -37,6 +38,7 @@ class TermUpdate(BaseModel):
     name_certified: bool | None = None
     description_certified: bool | None = None
     owner_id: str | None = None
+    synonyms: list[str] | None = None
 
 
 class ColumnAttributeUpdate(BaseModel):
@@ -222,6 +224,8 @@ def update_term(request: Request, term_id: str, body: TermUpdate) -> dict:
         name = name.strip()
     if "name" in patch and not name:
         raise HTTPException(status_code=422, detail="Term name cannot be blank")
+    if "synonyms" in patch:
+        patch["synonyms"] = normalize_aliases(patch["synonyms"])
 
     row = terms_dal.update_term(
         term_id,
@@ -230,6 +234,7 @@ def update_term(request: Request, term_id: str, body: TermUpdate) -> dict:
         name_certified=patch.get("name_certified"),
         description_certified=patch.get("description_certified"),
         owner_id=owner_id,
+        synonyms=patch.get("synonyms"),
         set_owner=set_owner,
         modified_by=resolve_internal_user(request, required=False),
         touch=True,
@@ -239,7 +244,9 @@ def update_term(request: Request, term_id: str, body: TermUpdate) -> dict:
 
     # Certification flags carry no embedding content; only name/description
     # changes need suggestion invalidation and a VDB refresh.
-    content_changed = "name" in patch or "description" in patch
+    content_changed = any(
+        field in patch for field in ("name", "description", "synonyms")
+    )
     name_changed = (
         content_changed and (row.get("old_name") or "").strip() != row["name"].strip()
     )
@@ -249,7 +256,8 @@ def update_term(request: Request, term_id: str, body: TermUpdate) -> dict:
     if content_changed:
         try:
             term_service.refresh_term_embeddings(
-                term_id, refresh_dependent_attrs=name_changed
+                term_id,
+                refresh_dependent_attrs=name_changed or "synonyms" in patch,
             )
         except Exception:
             logger.warning(

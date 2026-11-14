@@ -243,6 +243,8 @@ def _build_rows(
         schema_names = [s for s in (term.get("schema_names") or []) if s]
         if schema_names:
             fields["schema_names"] = schema_names
+        if term.get("synonyms"):
+            fields["synonyms"] = format_aliases(term.get("synonyms"))
         rows.append(
             {
                 "text": text,
@@ -301,6 +303,8 @@ def _build_rows(
             "database_name": database_name,
             "source_path": path,
         }
+        if normalized_synonyms:
+            fields["synonyms"] = normalized_synonyms
         if a.get("schema_name"):
             fields["schema_name"] = a["schema_name"]
         if a.get("datatype"):

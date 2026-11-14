@@ -28,6 +28,7 @@ import ast
 import json
 import logging
 import random
+import re
 import time
 from typing import TYPE_CHECKING, Literal
 
@@ -55,6 +56,12 @@ PER_LABEL_LIMITS: dict[str, int] = {
     Labels.CUSTOM_ANALYSIS: 3,
     LABEL_SQL_ATTRIBUTE: 3,
 }
+
+# Fetch a wider vector candidate pool, then use the normalized query and the
+# text/aliases stored with each row to recover exact Chinese matches that a
+# multilingual embedding can rank below a semantically similar distractor.
+HYBRID_FETCH_MULTIPLIER = 3
+_ASCII_TOKEN_RE = re.compile(r"[a-z0-9_]+", re.IGNORECASE)
 
 # ``retriever.query`` embeds the entity text via the remote NIM embeddings
 # endpoint before it can run the vector search — a transient 5xx there
@@ -177,6 +184,67 @@ def _resolve_label_k(per_label_k: "int | dict[str, int]", label: str | None) -> 
     return int(per_label_k)
 
 
+def _lexical_tokens(value: str) -> set[str]:
+    """Create lightweight mixed Chinese/Latin tokens without a tokenizer."""
+    normalized = normalize_chinese_text(value).lower()
+    tokens = set(_ASCII_TOKEN_RE.findall(normalized))
+    cjk = [ch for ch in normalized if "\u4e00" <= ch <= "\u9fff"]
+    tokens.update(cjk)
+    tokens.update("".join(pair) for pair in zip(cjk, cjk[1:]))
+    return tokens
+
+
+def _lexical_score(query: str, row: dict) -> float:
+    """Score exact/near text matches, with Chinese character n-grams."""
+    query_text = normalize_chinese_text(query).lower()
+    candidate = " ".join(
+        str(row.get(key) or "")
+        for key in ("text", "name", "source", "source_column", "synonyms")
+    )
+    candidate_text = normalize_chinese_text(candidate).lower()
+    if not query_text or not candidate_text:
+        return 0.0
+    score = 0.0
+    if query_text in candidate_text:
+        score += 1.0
+    query_tokens = _lexical_tokens(query_text)
+    candidate_tokens = _lexical_tokens(candidate_text)
+    if query_tokens:
+        score += len(query_tokens & candidate_tokens) / len(query_tokens)
+    return min(score, 2.0)
+
+
+def _hybrid_rank_rows(
+    query: str, rows: list[dict], per_label_k: "int | dict[str, int]"
+) -> list[dict]:
+    """Fuse vector ordering with deterministic lexical evidence.
+
+    Vector distance remains the primary signal. Lexical evidence only breaks
+    close semantic ties and makes aliases/exact Chinese wording observable.
+    """
+    if not rows:
+        return []
+    ranked: list[tuple[float, int, dict]] = []
+    for index, row in enumerate(rows):
+        lexical = _lexical_score(query, row)
+        row["lexical_score"] = lexical
+        # Distance is not calibrated across backends; a rank-based vector
+        # component keeps this fusion stable while lexical matches are strong.
+        ranked.append((index - lexical * len(rows), index, row))
+    ranked.sort(key=lambda item: item[0])
+
+    counts: dict[str, int] = {}
+    output: list[dict] = []
+    for _, _, row in ranked:
+        label = str(row.get("label") or "")
+        count = counts.get(label, 0)
+        if count >= _resolve_label_k(per_label_k, label):
+            continue
+        counts[label] = count + 1
+        output.append(row)
+    return output
+
+
 def _escape_like(value: str) -> str:
     """Escape a literal for use inside a LIKE pattern with ``ESCAPE '\\'``."""
     return (
@@ -293,7 +361,15 @@ def _hits_to_semantic_rows(
             "label": lab,
             "score": score,
         }
-        for _field in ("name", "schema_name", "database_name", "data_type", "source"):
+        for _field in (
+            "name",
+            "schema_name",
+            "database_name",
+            "data_type",
+            "source",
+            "source_column",
+            "synonyms",
+        ):
             val = meta.get(_field)
             if val is not None:
                 row[_field] = val
@@ -337,14 +413,22 @@ def search_semantic_index(
         )
         vdb_kwargs = {"where": where_clause} if where_clause else None
         top_k = (
-            _resolve_label_k(per_label_k, label)
+            _resolve_label_k(per_label_k, label) * HYBRID_FETCH_MULTIPLIER
             if where_clause
-            else DEFAULT_FETCH_LIMIT
+            else DEFAULT_FETCH_LIMIT * HYBRID_FETCH_MULTIPLIER
         )
 
         hits = _query_with_retry(retriever, entity, top_k, vdb_kwargs)
         all_hits.extend(hits)
 
-    return _hits_to_semantic_rows(
-        all_hits, label_filter=allowed_labels, per_label_k=per_label_k
+    candidate_k = {
+        label: _resolve_label_k(per_label_k, label) * HYBRID_FETCH_MULTIPLIER
+        for label in (allowed_labels or {None})
+        if label is not None
+    }
+    rows = _hits_to_semantic_rows(
+        all_hits,
+        label_filter=allowed_labels,
+        per_label_k=candidate_k or PER_LABEL_LIMIT * HYBRID_FETCH_MULTIPLIER,
     )
+    return _hybrid_rank_rows(entity, rows, per_label_k)

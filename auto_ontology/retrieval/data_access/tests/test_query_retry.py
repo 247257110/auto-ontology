@@ -21,6 +21,7 @@ from openai import APITimeoutError, AuthenticationError, InternalServerError
 from auto_ontology.retrieval.data_access import semantic_search
 from auto_ontology.retrieval.data_access.semantic_search import (
     _is_retryable,
+    _hybrid_rank_rows,
     _query_with_retry,
 )
 
@@ -106,3 +107,38 @@ def test_semantic_search_normalizes_full_width_query_before_embedding(
 
     assert rows[0]["id"] == "id-1"
     assert captured == ["客户 收入"]
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    [
+        ("客户收入", "customer-revenue"),
+        ("订单数", "order-count"),
+        ("活跃用户", "active-users"),
+        ("设备故障率", "failure-rate"),
+    ],
+)
+def test_hybrid_ranking_recovers_chinese_alias_matches(
+    question: str, expected: str
+) -> None:
+    """The lexical signal should recover the exact Chinese semantic node."""
+    rows = [
+        {
+            "id": "semantic-distractor",
+            "label": "ColumnAttribute",
+            "text": "ColumnAttribute: 业务指标。相近的业务分析指标。",
+            "score": 0.01,
+        },
+        {
+            "id": expected,
+            "label": "ColumnAttribute",
+            "text": f"ColumnAttribute: {question}。Aliases: {question}。",
+            "synonyms": [question],
+            "score": 0.20,
+        },
+    ]
+
+    ranked = _hybrid_rank_rows(question, rows, 1)
+
+    assert ranked[0]["id"] == expected
+    assert ranked[0]["lexical_score"] > 0

@@ -275,7 +275,7 @@
     "get_term_record_for_table": "(table_id: 'str') -> 'dict[str, str] | None'",
     "semantic_layer_calculated": "() -> 'bool'",
     "term_is_in_scope": "(term_id: 'str', zone_ids: 'list[str] | None' = None, data_ids_by_zone: 'dict[str, set[str]] | None' = None) -> 'bool'",
-    "update_term": "(term_id: 'str', *, name: 'str | None' = None, description: 'str | None' = None, name_certified: 'bool | None' = None, description_certified: 'bool | None' = None, owner_id: 'str | None' = None, set_owner: 'bool' = False, modified_by: 'str | None' = None, touch: 'bool' = False) -> 'dict[str, Any] | None'",
+    "update_term": "(term_id: 'str', *, name: 'str | None' = None, description: 'str | None' = None, name_certified: 'bool | None' = None, description_certified: 'bool | None' = None, owner_id: 'str | None' = None, synonyms: 'list[str] | None' = None, set_owner: 'bool' = False, modified_by: 'str | None' = None, touch: 'bool' = False) -> 'dict[str, Any] | None'",
     "upsert_table_term": "(name: 'str', description: 'str', table_id: 'str', synonyms: 'list[str] | None' = None) -> 'tuple[str, str] | None'"
   },
   "users": {
