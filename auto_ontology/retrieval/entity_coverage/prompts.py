@@ -191,6 +191,7 @@ def create_question_extraction_prompt(
     *,
     evidence: str | None = None,
     include_subject: bool = True,
+    semantic_ir: dict | None = None,
 ) -> str:
     """Sanitize and extract entity noun phrases; optionally also name subject/acronyms.
 
@@ -200,6 +201,15 @@ def create_question_extraction_prompt(
     """
     glossary_section = format_glossary_section(glossary)
     evidence_section = format_evidence_section(evidence)
+    semantic_ir_section = ""
+    if semantic_ir:
+        semantic_ir_section = (
+            "## Semantic IR hints\n\n"
+            "Use these pre-parsed hints to preserve Chinese metrics, dimensions, "
+            "time expressions, and filters. They are retrieval hints, not schema "
+            "identifiers; do not invent entities from them.\n\n"
+            f"{semantic_ir}\n\n"
+        )
     if include_subject:
         intro = (
             "You rewrite conversational user requests into concise, SQL-ready "
@@ -232,7 +242,7 @@ information rather than database entities. 中文业务术语不要翻译成英�
 
 {_SANITIZE_AND_ENTITIES}
 {trailing}
-{language_guidance}{glossary_section}{evidence_section}## Input
+{language_guidance}{semantic_ir_section}{glossary_section}{evidence_section}## Input
 
 {question}
 """

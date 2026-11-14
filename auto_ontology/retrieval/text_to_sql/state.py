@@ -51,6 +51,7 @@ class TextToSQLPayload(TypedDict):
     # For graders that compare numbers exactly: rewrite explicit float casts in
     # the generated Postgres SQL to NUMERIC (see ``numeric_types``).
     numeric_type_alignment: NotRequired[bool]
+    semantic_ir: NotRequired[dict]
     # The clarified/merged question on its own — no hint blocks or SQL
     # references mixed in (unlike `evidence`, which carries those too).
     # Omitted by callers that never enrich the question.
@@ -105,6 +106,7 @@ class AgentState(TypedDict):
     data_retriever: Retriever
     semantic_retriever: Retriever
     domain_rules: list[dict[str, str]]
+    semantic_ir: NotRequired[dict]
     # User-curated Glossary definitions (the ``acronyms`` table), kept apart from
     # domain_rules so prompts can inject them without the custom-analysis SQL.
     # After ``question_extraction``, this is narrowed to the entries the LLM used.

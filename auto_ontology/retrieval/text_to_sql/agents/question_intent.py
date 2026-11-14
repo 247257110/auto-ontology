@@ -23,6 +23,7 @@ from auto_ontology.retrieval.text_to_sql.state import (
     AgentState,
     get_standalone_question,
 )
+from auto_ontology.retrieval.text_to_sql.semantic_ir import build_semantic_ir
 from auto_ontology.semantic.chinese import contains_cjk
 from auto_ontology.utils.llm_invoke import (
     StrictLLMOutputModel,
@@ -553,6 +554,12 @@ class QuestionIntentAgent(BaseAgent):
         )
         path_state["extracted_evidence"] = extracted
         path_state["normalized_question"] = rewritten
+        semantic_ir = build_semantic_ir(
+            rewritten,
+            question_type=question_type.value,
+            calculation_subtype=subtype.value if subtype else None,
+        )
+        path_state["semantic_ir"] = semantic_ir.model_dump(mode="json")
 
         merged_evidence = _merge_evidence(existing_evidence, extracted)
         self.logger.info(

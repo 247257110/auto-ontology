@@ -84,6 +84,7 @@ class QuestionExtractionAgent(BaseAgent):
                         glossary,
                         evidence=evidence,
                         include_subject=self._include_subject,
+                        semantic_ir=path_state.get("semantic_ir"),
                     )
                 )
             ]
@@ -117,6 +118,14 @@ class QuestionExtractionAgent(BaseAgent):
                     "Question extraction returned empty entities — using question"
                 )
                 entities = [sanitized]
+
+            ir_entities = (path_state.get("semantic_ir") or {}).get("entities", [])
+            for item in ir_entities:
+                phrase = str(item.get("text") or "").strip()
+                if phrase and phrase.casefold() not in {
+                    str(entity).strip().casefold() for entity in entities
+                }:
+                    entities.append(phrase)
 
             path_state["normalized_question"] = sanitized
             path_state["entities"] = entities
