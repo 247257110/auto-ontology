@@ -636,10 +636,6 @@ def test_resolution_always_normalizes_join_defaults() -> None:
             return_value=3,
         ),
         patch(
-            "auto_ontology.semantic.semantic_fk.prune_disjoint_semantic_fks",
-            return_value=0,
-        ),
-        patch(
             "auto_ontology.semantic.semantic_fk.select_semantic_fk_join_defaults"
         ) as select_defaults,
     ):
