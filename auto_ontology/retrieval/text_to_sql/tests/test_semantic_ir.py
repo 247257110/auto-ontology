@@ -5,6 +5,7 @@
 """Chinese Semantic IR behavior tests."""
 
 from auto_ontology.retrieval.text_to_sql.semantic_ir import build_semantic_ir
+from auto_ontology.retrieval.text_to_sql.metric_grounding import ground_metric_semantics
 
 
 def test_chinese_ir_preserves_metric_dimension_time_and_ranking() -> None:
@@ -77,3 +78,42 @@ def test_metric_semantics_preserve_explicit_formula_and_currency_scale() -> None
     specs = {item.name: item for item in ir.metric_specs}
     assert specs["收入"].unit == "currency:万元"
     assert specs["利润率"].formula_hint == "利润/收入"
+
+
+def test_metric_grounding_prefers_governed_sql_attribute() -> None:
+    ir = build_semantic_ir(
+        "查询客户收入",
+        question_type="calculation",
+        calculation_subtype="aggregation",
+    )
+
+    grounded = ground_metric_semantics(
+        ir.model_dump(mode="json"),
+        sql_attributes=[
+            {
+                "id": "sa-revenue",
+                "name": "客户收入",
+                "description": "已治理的收入指标",
+                "expression": "SUM(order_total - refund_total)",
+            }
+        ],
+        column_attributes=[
+            {"id": "ca-revenue", "name": "收入", "description": "物理收入列"}
+        ],
+    )
+
+    assert grounded[0]["status"] == "governed"
+    assert grounded[0]["selected"]["id"] == "sa-revenue"
+
+
+def test_metric_grounding_marks_missing_definition_unresolved() -> None:
+    ir = build_semantic_ir(
+        "查询客户收入",
+        question_type="calculation",
+        calculation_subtype="aggregation",
+    )
+
+    grounded = ground_metric_semantics(ir.model_dump(mode="json"))
+
+    assert grounded[0]["status"] == "unresolved"
+    assert grounded[0]["selected"] is None

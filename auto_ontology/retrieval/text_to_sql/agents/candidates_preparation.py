@@ -70,6 +70,7 @@ from auto_ontology.retrieval.text_to_sql.state import (
     get_question_for_processing,
     rules_to_text,
 )
+from auto_ontology.retrieval.text_to_sql.metric_grounding import ground_metric_semantics
 from auto_ontology.retrieval.text_to_sql.value_anchors import (
     anchor_tables_missing_from_scope,
     split_schema_named_anchors,
@@ -767,6 +768,12 @@ class CandidatePreparationAgent(BaseAgent):
                 "primary_attribute": primary_attribute,
                 "attribute_join_paths": attribute_join_paths,
                 "term_synonyms": term_synonyms,
+                "grounded_metrics": ground_metric_semantics(
+                    path_state.get("semantic_ir"),
+                    sql_attributes=sql_attributes,
+                    custom_analyses=custom_analyses,
+                    column_attributes=column_attributes,
+                ),
             }
         }
         if incoming_anchors:

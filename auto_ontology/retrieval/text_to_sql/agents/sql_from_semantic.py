@@ -109,6 +109,25 @@ def format_metric_semantics_section(path_state: dict[str, Any]) -> str:
         if spec.get("formula_hint"):
             line += f", hint={spec['formula_hint']}"
         lines.append(line)
+    grounded_metrics = path_state.get("grounded_metrics") or []
+    if grounded_metrics:
+        lines.append("Grounding against retrieved ontology objects:")
+        for metric in grounded_metrics:
+            selected = metric.get("selected") or {}
+            line = f"- {metric.get('name', '')}: status={metric.get('status', 'unresolved')}"
+            if selected:
+                line += (
+                    f", selected={selected.get('kind')}:{selected.get('name')}"
+                    f" (score={selected.get('score')})"
+                )
+                definition = (
+                    selected.get("expression")
+                    or selected.get("description")
+                    or selected.get("sql")
+                )
+                if definition:
+                    line += f"\n  Definition: {definition}"
+            lines.append(line)
     if ir.get("ambiguities"):
         lines.append("Ambiguities to resolve from ontology evidence:")
         lines.extend(f"- {item}" for item in ir["ambiguities"])

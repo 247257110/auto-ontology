@@ -80,6 +80,7 @@ _FULL_RETRY_PATH_KEYS_TO_CLEAR = frozenset(
         "_resume_from",
         "normalized_question",
         "semantic_ir",
+        "grounded_metrics",
         "question_type",
         "calculation_subtype",
         "sql_template",
