@@ -31,6 +31,16 @@ FilterOperator = Literal[
     "between",
     "contains",
 ]
+MetricAggregation = Literal[
+    "sum",
+    "count",
+    "avg",
+    "min",
+    "max",
+    "ratio",
+    "unknown",
+]
+MetricComparison = Literal["yoy", "mom", "qoq", "period_over_period", "none"]
 TimeKind = Literal["calendar", "rolling", "relative", "unknown"]
 
 
@@ -39,6 +49,16 @@ class SemanticEntity(BaseModel):
 
     text: str
     role: SemanticRole
+
+
+class SemanticMetric(BaseModel):
+    """A metric phrase plus the computation semantics expressed by the user."""
+
+    name: str
+    aggregation: MetricAggregation = "unknown"
+    unit: str | None = None
+    comparison: MetricComparison = "none"
+    formula_hint: str | None = None
 
 
 class SemanticFilter(BaseModel):
@@ -70,6 +90,7 @@ class SemanticIR(BaseModel):
     subject: str | None = None
     entities: list[SemanticEntity] = Field(default_factory=list)
     metrics: list[str] = Field(default_factory=list)
+    metric_specs: list[SemanticMetric] = Field(default_factory=list)
     dimensions: list[str] = Field(default_factory=list)
     filters: list[SemanticFilter] = Field(default_factory=list)
     time_ranges: list[SemanticTimeRange] = Field(default_factory=list)
@@ -117,7 +138,9 @@ _METRIC_TERMS = (
     "数量",
     "金额",
     "利润",
+    "利润率",
     "成本",
+    "客单价",
     "转化率",
     "占比",
     "平均值",
@@ -139,7 +162,72 @@ def _language(question: str) -> Literal["zh", "mixed", "other"]:
 
 
 def _metric_phrases(question: str) -> list[str]:
-    return [term for term in _METRIC_TERMS if term in question]
+    matches = [term for term in _METRIC_TERMS if term in question]
+    return [
+        term
+        for term in sorted(matches, key=len, reverse=True)
+        if not any(term != other and term in other for other in matches)
+    ]
+
+
+def _metric_specs(question: str, metrics: list[str]) -> list[SemanticMetric]:
+    specs: list[SemanticMetric] = []
+    for metric in metrics:
+        aggregation: MetricAggregation = "unknown"
+        if metric.endswith(("率", "占比")) or re.search(r"百分比|比例", metric):
+            aggregation = "ratio"
+        elif re.search(r"平均|均值|人均", question):
+            aggregation = "avg"
+        elif metric.endswith(("数", "数量", "量")) or re.search(
+            r"多少|几家|几笔|几位", question
+        ):
+            aggregation = "count"
+        elif metric.endswith(("率", "占比")) or re.search(r"百分比|比例", question):
+            aggregation = "ratio"
+        elif re.search(r"总|合计", question):
+            aggregation = "sum"
+
+        unit: str | None = None
+        if metric.endswith(("率", "占比")) or re.search(r"百分比|比例", question):
+            unit = "percent"
+        elif currency_match := re.search(r"万元|亿元|元", question):
+            unit = f"currency:{currency_match.group(0)}"
+        elif re.search(r"人均", question):
+            unit = "per_person"
+        elif metric.endswith(("数", "数量", "量")):
+            unit = "count"
+
+        comparison: MetricComparison = "none"
+        if "同比" in question or "去年同期" in question:
+            comparison = "yoy"
+        elif "环比" in question:
+            comparison = "mom"
+        elif "季度对比" in question:
+            comparison = "qoq"
+
+        formula_hint = None
+        explicit_formula = re.search(
+            rf"{re.escape(metric)}\s*(?:是|为|=|等于)\s*([^，。；;]+)",
+            question,
+        )
+        if explicit_formula:
+            formula_hint = explicit_formula.group(1).strip()
+        if aggregation == "ratio":
+            formula_hint = formula_hint or (
+                "ratio_or_percentage; use the governed metric definition"
+            )
+        elif "人均" in question and formula_hint is None:
+            formula_hint = "per_person; use the governed metric definition"
+        specs.append(
+            SemanticMetric(
+                name=metric,
+                aggregation=aggregation,
+                unit=unit,
+                comparison=comparison,
+                formula_hint=formula_hint,
+            )
+        )
+    return specs
 
 
 def _dimension_phrases(question: str) -> list[str]:
@@ -225,6 +313,7 @@ def build_semantic_ir(
     """
     normalized = normalize_chinese_text(question)
     metrics = _metric_phrases(normalized)
+    metric_specs = _metric_specs(normalized, metrics)
     dimensions = _dimension_phrases(normalized)
     times = _time_ranges(normalized)
     filters = _filters(normalized)
@@ -264,6 +353,7 @@ def build_semantic_ir(
         subject=subject,
         entities=entities,
         metrics=metrics,
+        metric_specs=metric_specs,
         dimensions=dimensions,
         filters=filters,
         time_ranges=times,
@@ -279,6 +369,7 @@ __all__ = [
     "SemanticEntity",
     "SemanticFilter",
     "SemanticIR",
+    "SemanticMetric",
     "SemanticTimeRange",
     "build_semantic_ir",
 ]

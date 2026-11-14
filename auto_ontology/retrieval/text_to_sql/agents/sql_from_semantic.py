@@ -87,6 +87,34 @@ the same identifiers or values.
 """
 
 
+def format_metric_semantics_section(path_state: dict[str, Any]) -> str:
+    """Render Chinese metric intent without pretending it is a schema mapping."""
+    ir = path_state.get("semantic_ir") or {}
+    specs = ir.get("metric_specs") or []
+    if not specs:
+        return ""
+    lines = [
+        "## Metric semantic intent",
+        "These are user-language metric semantics, not physical column names.",
+        "Prefer a retrieved governed SQL Attribute/Custom Analysis definition when "
+        "available. If no definition exists, preserve the ambiguity and do not "
+        "invent a formula.",
+    ]
+    for spec in specs:
+        line = f"- {spec.get('name', '')}: aggregation={spec.get('aggregation', 'unknown')}"
+        if spec.get("unit"):
+            line += f", unit={spec['unit']}"
+        if spec.get("comparison") and spec["comparison"] != "none":
+            line += f", comparison={spec['comparison']}"
+        if spec.get("formula_hint"):
+            line += f", hint={spec['formula_hint']}"
+        lines.append(line)
+    if ir.get("ambiguities"):
+        lines.append("Ambiguities to resolve from ontology evidence:")
+        lines.extend(f"- {item}" for item in ir["ambiguities"])
+    return "\n".join(lines) + "\n"
+
+
 class SQLFromCandidatesAgent(BaseAgent):
     """
     Agent that constructs SQL from semantic retrieval and prepared schema context.
@@ -153,6 +181,7 @@ class SQLFromCandidatesAgent(BaseAgent):
         sql_examples_section = format_sql_examples_section(state.get("sql_examples"))
         value_anchors_section = format_value_anchors_section(state.get("value_anchors"))
         calculation_template_section = format_calculation_sql_template(path_state)
+        metric_semantics_section = format_metric_semantics_section(path_state)
         main_question = format_dual_question_block(
             original_question, sanitized_question
         )
@@ -203,6 +232,8 @@ class SQLFromCandidatesAgent(BaseAgent):
                 "Injecting the %s calculation SQL shape into the SQL prompt.",
                 path_state.get("calculation_subtype"),
             )
+        if metric_semantics_section:
+            self.logger.info("Injecting metric semantic intent into SQL prompt.")
 
         def build_messages() -> list:
             """
@@ -235,6 +266,8 @@ class SQLFromCandidatesAgent(BaseAgent):
                 observation_block += f"\n{glossary_section}"
             if authoritative_evidence_section:
                 observation_block += f"\n{authoritative_evidence_section}\n"
+            if metric_semantics_section:
+                observation_block += f"\n{metric_semantics_section}\n"
             # Build custom analyses section for user prompt
             ca_section = format_custom_analyses_section(custom_analyses)
 
