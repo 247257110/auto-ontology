@@ -75,6 +75,7 @@ class SemanticTimeRange(BaseModel):
 
     expression: str
     kind: TimeKind
+    canonical: str = "unknown"
     granularity: Literal["day", "week", "month", "quarter", "year", "unknown"] = (
         "unknown"
     )
@@ -254,10 +255,36 @@ def _time_ranges(question: str) -> list[SemanticTimeRange]:
                     SemanticTimeRange(
                         expression=expression,
                         kind=kind,
+                        canonical=_canonical_time(expression, kind, granularity),
                         granularity=granularity,
                     )
                 )
     return result
+
+
+def _canonical_time(expression: str, kind: TimeKind, granularity: str) -> str:
+    rolling = re.fullmatch(r"最近\s*(\d+)\s*(天|周|个月|年)", expression)
+    if rolling:
+        unit = {"天": "d", "周": "w", "个月": "mo", "年": "y"}[rolling.group(2)]
+        return f"rolling_{rolling.group(1)}{unit}"
+    calendar = {
+        "去年": "previous_calendar_year",
+        "今年": "current_calendar_year",
+        "前年": "two_years_ago",
+        "上个月": "previous_calendar_month",
+        "本月": "current_calendar_month",
+        "下个月": "next_calendar_month",
+        "上季度": "previous_calendar_quarter",
+        "本季度": "current_calendar_quarter",
+        "下季度": "next_calendar_quarter",
+        "上周": "previous_calendar_week",
+        "本周": "current_calendar_week",
+        "下周": "next_calendar_week",
+        "昨天": "previous_calendar_day",
+        "今天": "current_calendar_day",
+        "明天": "next_calendar_day",
+    }
+    return calendar.get(expression, f"{kind}_{granularity}")
 
 
 def _filters(question: str) -> list[SemanticFilter]:

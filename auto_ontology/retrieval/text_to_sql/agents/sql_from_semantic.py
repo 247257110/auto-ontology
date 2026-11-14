@@ -46,6 +46,9 @@ from auto_ontology.retrieval.text_to_sql.state import (
     get_original_question,
     get_question_for_processing,
 )
+from auto_ontology.retrieval.text_to_sql.metric_grounding import (
+    build_metric_clarification_question,
+)
 from auto_ontology.retrieval.text_to_sql.prompts import (
     create_sql_from_candidates_prompt,
     create_sql_user_prompt,
@@ -131,6 +134,13 @@ def format_metric_semantics_section(path_state: dict[str, Any]) -> str:
     if ir.get("ambiguities"):
         lines.append("Ambiguities to resolve from ontology evidence:")
         lines.extend(f"- {item}" for item in ir["ambiguities"])
+    time_ranges = ir.get("time_ranges") or []
+    if time_ranges:
+        lines.append("Normalized time semantics:")
+        lines.extend(
+            f"- {item.get('expression', '')}: {item.get('canonical', 'unknown')}"
+            for item in time_ranges
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -215,6 +225,20 @@ class SQLFromCandidatesAgent(BaseAgent):
         sql_attributes = path_state.get("sql_attributes", [])
         sql_attributes_str = path_state.get("sql_attributes_str", [])
         term_synonyms: dict = path_state.get("term_synonyms") or {}
+
+        metric_clarification = build_metric_clarification_question(
+            path_state.get("grounded_metrics")
+        )
+        if metric_clarification:
+            self.logger.info("Metric grounding requires clarification before SQL.")
+            return {
+                "decision": "unconstructable",
+                "path_state": {
+                    **path_state,
+                    "metric_clarification_question": metric_clarification,
+                    "unconstructable_explanation": metric_clarification,
+                },
+            }
 
         connector = resolve_connector_from_tables(relevant_tables, connectors)
         dialect = getattr(connector, "dialect", None)

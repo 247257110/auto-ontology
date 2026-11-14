@@ -81,6 +81,7 @@ _FULL_RETRY_PATH_KEYS_TO_CLEAR = frozenset(
         "normalized_question",
         "semantic_ir",
         "grounded_metrics",
+        "metric_clarification_question",
         "question_type",
         "calculation_subtype",
         "sql_template",

@@ -5,7 +5,10 @@
 """Chinese Semantic IR behavior tests."""
 
 from auto_ontology.retrieval.text_to_sql.semantic_ir import build_semantic_ir
-from auto_ontology.retrieval.text_to_sql.metric_grounding import ground_metric_semantics
+from auto_ontology.retrieval.text_to_sql.metric_grounding import (
+    build_metric_clarification_question,
+    ground_metric_semantics,
+)
 
 
 def test_chinese_ir_preserves_metric_dimension_time_and_ranking() -> None:
@@ -20,6 +23,7 @@ def test_chinese_ir_preserves_metric_dimension_time_and_ranking() -> None:
     assert ir.dimensions == ["地区"]
     assert ir.time_ranges[0].expression == "去年"
     assert ir.time_ranges[0].kind == "calendar"
+    assert ir.time_ranges[0].canonical == "previous_calendar_year"
     assert ir.sort_order == "desc"
     assert ir.limit == 5
     assert ir.retrieval_entities()[:2] == ["收入", "地区"]
@@ -116,4 +120,16 @@ def test_metric_grounding_marks_missing_definition_unresolved() -> None:
     grounded = ground_metric_semantics(ir.model_dump(mode="json"))
 
     assert grounded[0]["status"] == "unresolved"
+    assert grounded[0]["confidence"] == 0.0
     assert grounded[0]["selected"] is None
+
+
+def test_unresolved_metric_produces_one_focused_chinese_question() -> None:
+    question = build_metric_clarification_question(
+        [{"name": "客户收入", "status": "unresolved", "matches": []}]
+    )
+
+    assert question == (
+        "暂未找到指标“客户收入”的明确治理定义。请补充该指标的业务含义、"
+        "对应字段，或提供计算公式后再查询。"
+    )

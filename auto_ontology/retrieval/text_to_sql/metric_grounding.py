@@ -129,6 +129,24 @@ def ground_metric_semantics(
                     if annotations
                     else "unresolved"
                 ),
+                "confidence": (
+                    0.0
+                    if not annotations
+                    else 0.45
+                    if ambiguous
+                    else min(0.99, round(0.55 + (selected["score"] * 0.4), 4))
+                    if selected
+                    else 0.0
+                ),
+                "reason": (
+                    "未找到匹配的本体指标或字段"
+                    if not annotations
+                    else "多个治理指标分数接近，需要用户选择"
+                    if ambiguous
+                    else "已匹配到治理指标定义"
+                    if governed
+                    else "仅匹配到普通字段候选，缺少治理公式"
+                ),
                 "selected": selected,
                 "matches": annotations,
             }
@@ -136,4 +154,29 @@ def ground_metric_semantics(
     return grounded
 
 
-__all__ = ["ground_metric_semantics"]
+def build_metric_clarification_question(
+    grounded_metrics: list[dict[str, Any]] | None,
+) -> str | None:
+    """Build one focused Chinese question for an unsafe metric grounding."""
+    for metric in grounded_metrics or []:
+        name = str(metric.get("name") or "").strip()
+        status = metric.get("status")
+        if not name or status not in {"unresolved", "ambiguous"}:
+            continue
+        matches = metric.get("matches") or []
+        if status == "ambiguous" and matches:
+            choices = "、".join(
+                str(item.get("name") or "未命名指标") for item in matches[:3]
+            )
+            return (
+                f"指标“{name}”对应多个口径（{choices}）。请确认要使用哪一个指标，"
+                "或补充它的业务定义/计算公式。"
+            )
+        return (
+            f"暂未找到指标“{name}”的明确治理定义。请补充该指标的业务含义、"
+            "对应字段，或提供计算公式后再查询。"
+        )
+    return None
+
+
+__all__ = ["build_metric_clarification_question", "ground_metric_semantics"]
