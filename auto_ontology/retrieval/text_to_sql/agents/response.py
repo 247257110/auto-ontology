@@ -20,6 +20,7 @@ from langchain_core.messages import AIMessage
 from auto_ontology.retrieval.text_to_sql.base import BaseAgent
 from auto_ontology.retrieval.text_to_sql.state import AgentState
 from auto_ontology.retrieval.data_access.response_formatting import format_response
+from auto_ontology.retrieval.text_to_sql.answer_context import attach_answer_notes
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,9 @@ class ResponseAgent(BaseAgent):
             candidates=candidates,
             response=response_explanation,
         )
+        # What the run resolved — certified definitions, anchored dates, a
+        # verified-empty verdict — is part of the answer (see answer_context).
+        formatted_response = attach_answer_notes(formatted_response, path_state)
 
         # --- final dict assembly ---
         sql_columns = path_state.get("sql_columns", [])

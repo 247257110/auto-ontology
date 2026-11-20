@@ -502,6 +502,7 @@ workflow is in [CONTRIBUTING.md](./CONTRIBUTING.md).
 | --------------------------------------- | ---------------------------------------------------- |
 | Chinese usage manual (中文使用手册)      | [docs/使用手册.md](./docs/使用手册.md)               |
 | Wide World Importers data dictionary (数据字典与问法) | [docs/wideworldimporters-数据字典与问法.md](./docs/wideworldimporters-数据字典与问法.md) |
+| Common business predictions as PQL (PQL 业务预测场景) | [docs/pql-业务预测场景.md](./docs/pql-业务预测场景.md) |
 | Kubernetes deployment with Helm         | [DEPLOYMENT.md](./DEPLOYMENT.md)                     |
 | Connections, scoping, and Vault         | [docs/connections.md](./docs/connections.md)         |
 | Authentication, SSO, and API tokens     | [docs/authentication.md](./docs/authentication.md)   |

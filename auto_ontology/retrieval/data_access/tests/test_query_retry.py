@@ -142,3 +142,50 @@ def test_hybrid_ranking_recovers_chinese_alias_matches(
 
     assert ranked[0]["id"] == expected
     assert ranked[0]["lexical_score"] > 0
+
+
+def test_certified_row_breaks_a_vector_near_tie() -> None:
+    """Certification lifts a vetted node above an equal-lexical distractor.
+
+    The two interesting rows have identical text (so identical lexical scores),
+    but the certified one ranks one vector position worse. With enough rows the
+    certified bonus outweighs that single position gap and it wins — without
+    the bonus the closer-vector distractor would.
+    """
+    rows = [
+        {
+            "id": "uncertified",
+            "label": "ColumnAttribute",
+            "text": "ColumnAttribute: 毛利率。",
+            "score": 0.01,
+        },
+        {
+            "id": "certified",
+            "label": "ColumnAttribute",
+            "text": "ColumnAttribute: 毛利率。",
+            "certified": True,
+            "score": 0.02,
+        },
+        {
+            "id": "f1",
+            "label": "ColumnAttribute",
+            "text": "ColumnAttribute: 无关。",
+            "score": 0.5,
+        },
+        {
+            "id": "f2",
+            "label": "ColumnAttribute",
+            "text": "ColumnAttribute: 无关。",
+            "score": 0.6,
+        },
+        {
+            "id": "f3",
+            "label": "ColumnAttribute",
+            "text": "ColumnAttribute: 无关。",
+            "score": 0.7,
+        },
+    ]
+
+    ranked = _hybrid_rank_rows("毛利率", rows, 5)
+
+    assert ranked[0]["id"] == "certified"

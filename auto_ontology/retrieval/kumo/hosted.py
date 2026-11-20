@@ -39,6 +39,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 import pandas as pd
@@ -232,6 +233,11 @@ def _scalar(value: Any) -> Any:
         return int(value)
     if isinstance(value, float):
         return None if math.isnan(value) or math.isinf(value) else value
+    if isinstance(value, Decimal):
+        # Postgres ``numeric`` arrives as Decimal even though pandas types the
+        # column as object. Send a real number so it matches a `numerical`
+        # declaration instead of leaking a quoted string into the frame.
+        return None if value.is_nan() or value.is_infinite() else float(value)
     try:
         if pd.isna(value):
             return None
@@ -248,6 +254,22 @@ def _scalar(value: Any) -> Any:
     return str(value)
 
 
+def _is_decimal_series(series: pd.Series) -> bool:
+    """True when an object column holds decimals the warehouse left untyped.
+
+    Postgres ``numeric`` arrives as :class:`decimal.Decimal` objects, which
+    pandas types as ``object``. Read as a string, a measure looks like free
+    text: it would be declared categorical, dropped once it is wide, and every
+    value would reach the endpoint quoted. It is a number, so say so.
+    """
+    if series.dtype != object:
+        return False
+    values = series.dropna()
+    if values.empty:
+        return False
+    return all(isinstance(value, Decimal) for value in values)
+
+
 def _dtype_of(series: pd.Series) -> tuple[str, str]:
     dtype = series.dtype
     if pd.api.types.is_bool_dtype(dtype):
@@ -258,6 +280,8 @@ def _dtype_of(series: pd.Series) -> tuple[str, str]:
         return "float64", "numerical"
     if pd.api.types.is_datetime64_any_dtype(dtype):
         return "timestamp[us]", "timestamp"
+    if _is_decimal_series(series):
+        return "float64", "numerical"
     return "string", "categorical"
 
 
@@ -269,6 +293,14 @@ _MAX_CATEGORICAL = 10_000
 # fewer columns, which is what :meth:`HostedKumoModel._repair_shape` does.
 _CARDINALITY_RE = re.compile(
     r"categorical cardinality (\d+) exceeds limit (\d+)", re.IGNORECASE
+)
+
+# Hosted validation is stricter than the local graph for a few source-specific
+# string columns.  The endpoint names the offending column, which lets us drop
+# an optional descriptive feature while preserving keys and relationships.
+_SEMANTIC_COLUMN_RE = re.compile(
+    r"column\s+['\"]([^'\"]+)['\"]\s+declares\s+semantic",
+    re.IGNORECASE,
 )
 
 _NUMERIC_DTYPES = frozenset({"int64", "float64"})
@@ -289,7 +321,17 @@ def _cardinality(series: pd.Series) -> int:
 
 def _column_spec(
     series: pd.Series, declared: str | None, *, where: str | None = None
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
+    """The endpoint's declaration for one column, or ``None`` if it cannot be sent.
+
+    ``None`` is a string column too wide to be a category. The local engine
+    calls that column ``text``, but the hosted SDM reads no ``text`` semantic
+    type — declaring it is refused outright with ``422 UNSUPPORTED_DTYPE`` —
+    and categorical stops at :data:`_MAX_CATEGORICAL`. Such a column is a
+    free-text feature the model could not have used as a category anyway, so
+    the caller leaves it out of the payload (see
+    :meth:`HostedKumoModel._unreadable_columns`) rather than fail the question.
+    """
     dtype, stype = _dtype_of(series)
     if declared:
         stype = declared
@@ -297,17 +339,23 @@ def _column_spec(
             dtype = "timestamp[us]"
         elif declared == "numerical" and dtype == "string":
             dtype = "float64"
+    if stype.casefold() == "text":
+        # A semantic layer may declare `text` directly, and wide strings
+        # resolve to it locally. The hosted endpoint has no such type, so send
+        # what the column can be there: a measure when numeric, a category when
+        # the endpoint can encode it (checked below).
+        stype = "numerical" if dtype in _NUMERIC_DTYPES else "categorical"
     if stype == "categorical":
         distinct = _cardinality(series)
         if distinct > _MAX_CATEGORICAL:
             # Ask for what the column actually is, not for a category it cannot
-            # be within the endpoint's ceiling. Two things have to move together:
-            # the stype AND the dtype. A free-text column is honestly `text`; a
-            # numeric one — an id or a measure the semantic layer called a
-            # dimension — is `numerical`, because declaring int64/float64 as
-            # `text` leaves a pair the endpoint has to reinterpret, and a wide
-            # column keeps the request at risk of the same 422.
-            stype = "numerical" if dtype in _NUMERIC_DTYPES else "text"
+            # be within the endpoint's ceiling. A numeric column — an id or a
+            # measure the semantic layer called a dimension — is `numerical`.
+            # A string has no fallback: `text` is not a type the endpoint
+            # reads, so it is left out of the payload.
+            if dtype not in _NUMERIC_DTYPES:
+                return None
+            stype = "numerical"
             if where:
                 logger.info(
                     "kumo: %s has %d distinct values (%s) — declaring it %s rather than "
@@ -432,7 +480,26 @@ class HostedKumoModel:
         except RuntimeError as error:
             match = _CARDINALITY_RE.search(str(error))
             if match is None:
-                raise
+                semantic = _SEMANTIC_COLUMN_RE.search(str(error))
+                if semantic is None:
+                    raise
+                column = semantic.group(1)
+                targets = {
+                    (table, column)
+                    for table, declaration in (
+                        (payload.get("schema") or {}).get("related_tables") or {}
+                    ).items()
+                    if column in (declaration.get("columns") or {})
+                }
+                targets -= _joined_columns(payload)
+                if not targets:
+                    raise
+                logger.warning(
+                    "kumo: hosted validation rejected optional column %s; retrying without it",
+                    ", ".join(sorted(f"{table}.{name}" for table, name in targets)),
+                )
+                _drop_columns(payload, targets)
+                return self._post(payload)
             limit = int(match.group(2))
             dropped_any = False
             for dropped in self._repair_steps(payload, limit):
@@ -463,11 +530,16 @@ class HostedKumoModel:
     ) -> list[set[tuple[str, str]]]:
         """Which columns to drop, as cumulative batches, least loss first.
 
-        A categorical or text column over the limit is a feature that cannot be
-        encoded as a category; an ``ID`` column of a *related* table over the
-        limit is that table's own row identity, which the model does not need to
+        A categorical column over the limit is a feature that cannot be encoded
+        as a category; an ``ID`` column of a *related* table over the limit is
+        that table's own row identity, which the model does not need to
         recognise a row. Both are dropped only when no relationship joins on
         them.
+
+        ``text`` remains in the first batch defensively: the payload no longer
+        sends it (the hosted SDM does not read it, see :func:`_column_spec`),
+        but if any path ever does, it is still a column too wide to be a
+        category.
         """
         report = _shape_report(payload)
         related = set((payload.get("schema") or {}).get("related_tables") or {})
@@ -742,11 +814,10 @@ class HostedKumoModel:
         """Historical context anchors, plus the anchor the prediction is made at.
 
         A caller-supplied anchor wins outright; the end of the data is only the
-        fallback. The caller has already backed the anchor off by the horizon
-        (see ``pql_gen._forecast_anchor``) so that ``[anchor, anchor + horizon]``
-        lands inside observed data — clamping it forward to the last row undoes
-        exactly that, and leaves the window predicting a future the warehouse has
-        no rows for.
+        fallback. The caller anchors forward forecasts at today (see
+        ``pql_gen._forecast_anchor``), and ``[anchor, anchor + horizon]`` is
+        deliberately the future — clamping it back to the last row would answer
+        a different question.
         """
         span = self._history_span(spec, entity)
         latest = None
@@ -1141,6 +1212,8 @@ class HostedKumoModel:
         context_related = self._related_for(entity, context_instances, spec)
         predict_related = self._related_for(entity, predict_instances, spec)
 
+        self._drop_unreadable_columns(entity, pk, context_related, predict_related)
+
         task = self._task(spec, entity, context)
         columns = [_INSTANCE_ID, _ANCHOR, pk, "label"]
         predict_columns = [_INSTANCE_ID, _ANCHOR, pk]
@@ -1413,6 +1486,86 @@ class HostedKumoModel:
         ]
         return pd.DataFrame(rows, columns=columns, dtype=object)
 
+    def _unreadable_columns(
+        self, related: dict[str, pd.DataFrame]
+    ) -> set[tuple[str, str]]:
+        """Columns whose declaration the hosted endpoint cannot read.
+
+        The local engine calls a wide free-text column ``text``; the hosted SDM
+        reads no such semantic type, and categorical stops at
+        :data:`_MAX_CATEGORICAL`. A string column over that ceiling therefore
+        has no declaration the endpoint accepts — it is refused with
+        ``422 UNSUPPORTED_DTYPE`` before any row is read.
+        """
+        found: set[tuple[str, str]] = set()
+        for name, frame in related.items():
+            meta = self._meta(name)
+            for column in frame.columns:
+                if column == _INSTANCE_ID:
+                    continue
+                declared = self._declared_stype(meta.name if meta else name, column)
+                base = None
+                if meta is not None and column in meta.frame.columns:
+                    base = meta.frame[column]
+                if (
+                    _column_spec(base if base is not None else frame[column], declared)
+                    is None
+                ):
+                    found.add((_table_name(name), column))
+        return found
+
+    def _linked_columns(self, entity: TableMeta, pk: str) -> set[tuple[str, str]]:
+        """Columns a relationship or the instance key joins on: never dropped."""
+        linked = {(_table_name(entity.name), pk)}
+        for src, fkey, dst in self._links:
+            linked.add((_table_name(src), fkey))
+            dst_meta = self._meta(dst)
+            dst_key = (
+                dst_meta.primary_keys[0]
+                if dst_meta is not None and len(dst_meta.primary_keys) == 1
+                else fkey
+            )
+            linked.add((_table_name(dst), dst_key))
+        return linked
+
+    def _drop_unreadable_columns(
+        self,
+        entity: TableMeta,
+        pk: str,
+        context_related: dict[str, pd.DataFrame],
+        predict_related: dict[str, pd.DataFrame],
+    ) -> None:
+        """Leave unsendable free-text columns out of both frames.
+
+        Runs before the schema is built, so the declaration and the rows always
+        agree. A width rejection from the endpoint is repairable after the fact
+        (see :meth:`_predict_response`), but a semantic type the SDM does not
+        read cannot be repaired by resending the same column: it has to be gone
+        from the first request. Join columns are kept regardless — dropping one
+        would break the graph rather than just a feature.
+        """
+        known = dict(context_related)
+        for name, frame in predict_related.items():
+            known.setdefault(name, frame)
+        skipped = self._unreadable_columns(known) - self._linked_columns(entity, pk)
+        if not skipped:
+            return
+        logger.info(
+            "kumo: leaving %s out of the hosted payload — the endpoint's SDM reads "
+            "no `text` semantic type, and categorical stops at %d values",
+            ", ".join(sorted(f"{table}.{column}" for table, column in skipped)),
+            _MAX_CATEGORICAL,
+        )
+        for frames in (context_related, predict_related):
+            for name in list(frames):
+                gone = [
+                    column
+                    for owner, column in skipped
+                    if owner == _table_name(name) and column in frames[name].columns
+                ]
+                if gone:
+                    frames[name] = frames[name].drop(columns=gone)
+
     def _schema(
         self,
         spec: TaskSpec,
@@ -1429,36 +1582,56 @@ class HostedKumoModel:
                 "stype": "timestamp",
                 "nullable": False,
             },
-            pk: _column_spec(
-                entity.frame[pk],
-                self._declared_stype(entity.name, pk) or "ID",
-                where=f"{entity.name}.{pk}",
-            ),
+            # The instance table's key names the entity, so it is an identity
+            # column regardless of the local graph's stype: declaring a wide
+            # string key as `text` would be refused before any row is read.
+            pk: _column_spec(entity.frame[pk], "ID", where=f"{entity.name}.{pk}"),
             "label": self._label_spec(spec, context),
         }
         related_schema: dict[str, Any] = {}
+        linked = self._linked_columns(entity, pk)
         for name, frame in related.items():
             columns: dict[str, Any] = {
                 _INSTANCE_ID: {"dtype": "int64", "stype": "ID", "nullable": False},
             }
             meta = self._meta(name)
+            table_key = _table_name(name)
             for column in frame.columns:
                 if column == _INSTANCE_ID:
                     continue
                 declared = self._declared_stype(meta.name if meta else name, column)
+                if (
+                    declared is not None
+                    and declared.casefold() == "text"
+                    and (table_key, column) in linked
+                ):
+                    # A relationship joins on this column, so it identifies a
+                    # row rather than describing one: it is an ID whatever the
+                    # local graph called it, and IDs have no categorical
+                    # ceiling (and no `text` refusal waiting for them).
+                    declared = "ID"
                 # Take the dtype from the warehouse frame, not from the payload
                 # frame: the latter is object-typed by design (see _clean).
                 base = None
                 if meta is not None and column in meta.frame.columns:
                     base = meta.frame[column]
-                columns[column] = _column_spec(
+                column_spec = _column_spec(
                     base if base is not None else frame[column],
                     declared,
                     where=f"{meta.name if meta else name}.{column}",
                 )
-            related_schema[_table_name(name)] = {
+                if column_spec is not None:
+                    columns[column] = column_spec
+            related_schema[table_key] = {
                 "columns": columns,
-                "primary_key": [_INSTANCE_ID] + list(meta.primary_keys if meta else []),
+                # A column left out by _unreadable_columns cannot stay a
+                # declared key either; the endpoint checks the two together.
+                "primary_key": [_INSTANCE_ID]
+                + [
+                    column
+                    for column in (meta.primary_keys if meta else ())
+                    if column in frame.columns
+                ],
             }
         relationships = [
             {

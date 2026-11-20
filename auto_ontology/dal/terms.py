@@ -63,6 +63,14 @@ from auto_ontology.utils.sample_values import stringify_sample_values
 logger = logging.getLogger(__name__)
 
 
+class TermNameConflict(ValueError):
+    """A Term with this name already exists.
+
+    ``(name, source)`` is a unique constraint, so a create cannot proceed; the
+    caller turns this into a 409 rather than merging into the existing Term.
+    """
+
+
 def _with_parsed_sample_values(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Render ``sample_values`` on each row as the string list callers expect.
 
@@ -437,6 +445,7 @@ def upsert_table_term(
                 s.catalog_database.c.name.label("database_name"),
                 s.catalog_schema.c.name.label("schema_name"),
                 s.catalog_table.c.name.label("table_name"),
+                s.catalog_table.c.table_type,
             )
             .select_from(
                 s.catalog_table.join(
@@ -524,6 +533,109 @@ def upsert_table_term(
     raise RuntimeError(f"Could not allocate a private Term name for table {table_id}")
 
 
+def create_term(
+    *,
+    name: str,
+    description: str | None = None,
+    synonyms: list[str] | None = None,
+    table_ids: list[str],
+    name_certified: bool = False,
+    description_certified: bool = False,
+    owner_id: str | None = None,
+    created_by: str | None = None,
+) -> dict[str, Any]:
+    """Create a Term representing one or more tables.
+
+    Compilation only ever allocates one Term per table (:func:`upsert_table_term`),
+    which cannot express a *concept*: "客户地域" spans customers → cities →
+    stateprovinces and owns no single table. Linking several tables is what the
+    schema already allows (``table__term`` is many-to-many), and it is what makes
+    such a Term visible at all — every read filters on ``REPRESENTS`` existing
+    (see ``_represented``), so a Term with no table is unreachable.
+
+    Raises :class:`TermNameConflict` when ``(name, 'semantic')`` is taken. Not
+    merged into the existing Term on purpose: two Terms with one name cannot
+    both be embedded, and silently editing someone's glossary entry in response
+    to a create is worse than refusing.
+
+    ``table_ids`` is required and must be non-empty: a Term that represents no
+    table is excluded from every read by construction, so accepting an empty
+    list would report success and create a row nobody can ever see.
+    """
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError("Term name cannot be blank")
+    if not table_ids:
+        raise ValueError(
+            "A Term must represent at least one table; without one it is neither "
+            "listed nor retrievable"
+        )
+
+    with write_transaction():
+        conflict = store().query_read(
+            select(s.term.c.id).where(
+                s.term.c.name == cleaned, s.term.c.source == SEMANTIC_SOURCE
+            )
+        )
+        if conflict:
+            raise TermNameConflict(
+                f"Term named {cleaned!r} already exists (id={conflict[0]['id']!r})"
+            )
+
+        known_tables = {
+            row["id"]
+            for row in store().query_read(
+                select(s.catalog_table.c.id).where(
+                    s.catalog_table.c.id.in_(list(table_ids))
+                )
+            )
+        }
+        unknown = [table_id for table_id in table_ids if table_id not in known_tables]
+        if unknown:
+            # A link to a table that does not exist is a caller bug, and an
+            # unlinked Term is invisible — both are worth failing loudly over.
+            raise ValueError(f"Unknown table id(s): {', '.join(unknown)}")
+
+        inserted = store().query_write(
+            insert(s.term)
+            .values(
+                name=cleaned,
+                source=SEMANTIC_SOURCE,
+                description=description or "",
+                synonyms=synonyms or [],
+                name_certified=name_certified,
+                description_certified=description_certified,
+                owner_id=owner_id,
+                created_by=created_by,
+                modified_by=created_by,
+            )
+            .returning(s.term.c.id)
+        )
+        term_id = inserted[0]["id"]
+
+        store().query_write(
+            insert(s.table__term)
+            .values(
+                [
+                    {"term_id": term_id, "table_id": table_id}
+                    for table_id in dict.fromkeys(table_ids)
+                ]
+            )
+            .on_conflict_do_nothing()
+        )
+
+    return {
+        "id": term_id,
+        "name": cleaned,
+        "description": description or "",
+        "synonyms": synonyms or [],
+        "name_certified": name_certified,
+        "description_certified": description_certified,
+        "owner_id": owner_id,
+        "table_count": len(dict.fromkeys(table_ids)),
+    }
+
+
 def fetch_term_synonyms(attr_ids: list[str]) -> dict[str, list[str]]:
     """``{term_name: [synonym, ...]}`` for the terms behind these attributes.
 
@@ -602,6 +714,20 @@ def fetch_all_terms(
         .correlate(s.term)
         .scalar_subquery()
     )
+    # ``min`` deliberately: a Term is treated as a reference relation only when
+    # *every* table behind it is one. 'base table' sorts before 'view', so one
+    # live table in the mix keeps the Term ranked as a fact source.
+    table_type = (
+        select(func.min(s.catalog_table.c.table_type))
+        .select_from(
+            s.table__term.join(
+                s.catalog_table, s.catalog_table.c.id == s.table__term.c.table_id
+            )
+        )
+        .where(s.table__term.c.term_id == s.term.c.id)
+        .correlate(s.term)
+        .scalar_subquery()
+    )
 
     statement = (
         select(
@@ -610,6 +736,7 @@ def fetch_all_terms(
             s.term.c.synonyms,
             s.term.c.id,
             schema_names.label("schema_names"),
+            table_type.label("table_type"),
             s.term.c.name_certified,
             s.term.c.description_certified,
             s.term.c.owner_id,
@@ -673,9 +800,11 @@ def fetch_all_terms_and_attributes(
             s.catalog_column.c.is_unique,
             s.catalog_table.c.id.label("table_id"),
             s.catalog_table.c.name.label("table_name"),
+            s.catalog_table.c.table_type,
             s.column_attribute.c.id,
             s.catalog_schema.c.name.label("schema_name"),
             s.column_attribute.c.datatype,
+            s.column_attribute.c.certified,
         )
         .select_from(
             s.column_attribute.join(
@@ -698,6 +827,108 @@ def fetch_all_terms_and_attributes(
         statement = statement.where(s.catalog_table.c.id.in_(table_ids))
 
     return terms, [dict(r) for r in store().query_read(statement)]
+
+
+def _database_table_ids(database_name: str) -> list[str]:
+    """Table ids for one database, for scoping global Term nodes."""
+    rows = store().query_read(
+        select(s.catalog_table.c.id)
+        .select_from(
+            s.catalog_table.join(
+                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
+            ).join(
+                s.catalog_database,
+                s.catalog_database.c.id == s.catalog_schema.c.database_id,
+            )
+        )
+        .where(s.catalog_database.c.name == database_name)
+    )
+    return [r["id"] for r in rows]
+
+
+def fetch_terms_and_attributes_for_database(
+    database_name: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(terms, attrs)`` scoped to one database — the reindex work list.
+
+    Term nodes are global (no ``database_name`` column of their own), so scoping
+    goes through the tables that represent them — the same idiom as
+    :func:`fetch_terms_with_sqls`. Attributes are scoped by their owning
+    table's database. Both carry their certification flags so a re-embed can
+    preserve the retrieval-ranking metadata.
+    """
+    table_ids = _database_table_ids(database_name)
+    if not table_ids:
+        return [], []
+
+    terms = store().query_read(
+        select(
+            s.term.c.name,
+            s.term.c.description,
+            s.term.c.synonyms,
+            s.term.c.id,
+            s.term.c.name_certified,
+            s.term.c.description_certified,
+            func.array_agg(func.distinct(s.catalog_schema.c.name)).label(
+                "schema_names"
+            ),
+            func.min(s.catalog_table.c.table_type).label("table_type"),
+        )
+        .select_from(
+            s.table__term.join(s.term, s.term.c.id == s.table__term.c.term_id)
+            .join(s.catalog_table, s.catalog_table.c.id == s.table__term.c.table_id)
+            .join(
+                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
+            )
+        )
+        .where(
+            s.term.c.source == SEMANTIC_SOURCE,
+            s.table__term.c.table_id.in_(table_ids),
+        )
+        .group_by(s.term.c.id)
+        .order_by(func.lower(s.term.c.name), s.term.c.id)
+    )
+
+    attrs = store().query_read(
+        select(
+            s.column_attribute.c.name,
+            s.column_attribute.c.description,
+            s.column_attribute.c.term_name,
+            s.column_attribute.c.source_column,
+            s.catalog_column.c.name.label("column_name"),
+            s.catalog_column.c.description.label("column_description"),
+            attribute_family_prefix(s.column_attribute.c.id).label("family_prefix"),
+            s.catalog_column.c.sample_values,
+            s.catalog_column.c.is_unique,
+            s.catalog_table.c.id.label("table_id"),
+            s.catalog_table.c.name.label("table_name"),
+            s.catalog_table.c.table_type,
+            s.column_attribute.c.id,
+            s.catalog_schema.c.name.label("schema_name"),
+            s.column_attribute.c.datatype,
+            s.column_attribute.c.certified,
+        )
+        .select_from(
+            s.column_attribute.join(
+                s.column__has_attribute,
+                s.column__has_attribute.c.attribute_id == s.column_attribute.c.id,
+            )
+            .join(
+                s.catalog_column,
+                s.catalog_column.c.id == s.column__has_attribute.c.column_id,
+            )
+            .join(s.catalog_table, s.catalog_table.c.id == s.catalog_column.c.table_id)
+            .join(
+                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
+            )
+        )
+        .where(
+            s.column_attribute.c.source == SEMANTIC_SOURCE,
+            s.catalog_table.c.id.in_(table_ids),
+        )
+    )
+
+    return [dict(r) for r in terms], [dict(r) for r in attrs]
 
 
 def get_full_term_by_id(
@@ -884,6 +1115,7 @@ def fetch_table_schema_map(database_name: str) -> dict[str, str]:
     rows = store().query_read(
         select(
             s.catalog_table.c.name.label("table_name"),
+            s.catalog_table.c.table_type,
             s.catalog_schema.c.name.label("schema_name"),
         )
         .select_from(
@@ -1012,8 +1244,10 @@ def _embedding_attrs_for_table(table_id: str):
             s.catalog_column.c.is_unique,
             s.catalog_table.c.id.label("table_id"),
             s.catalog_table.c.name.label("table_name"),
+            s.catalog_table.c.table_type,
             s.column_attribute.c.id,
             s.catalog_schema.c.name.label("schema_name"),
+            s.column_attribute.c.certified,
         )
         .select_from(
             s.column_attribute.join(
@@ -1046,9 +1280,12 @@ def fetch_terms_and_attributes_for_table(
             s.term.c.description,
             s.term.c.synonyms,
             s.term.c.id,
+            s.term.c.name_certified,
+            s.term.c.description_certified,
             func.array_agg(func.distinct(s.catalog_schema.c.name)).label(
                 "schema_names"
             ),
+            func.min(s.catalog_table.c.table_type).label("table_type"),
         )
         .select_from(
             s.table__term.join(s.term, s.term.c.id == s.table__term.c.term_id)
@@ -1077,6 +1314,8 @@ def fetch_term_and_column_attributes_for_embedding(
             s.term.c.description,
             s.term.c.synonyms,
             s.term.c.id,
+            s.term.c.name_certified,
+            s.term.c.description_certified,
             s.catalog_database.c.name.label("database_name"),
         )
         .select_from(
@@ -1113,7 +1352,9 @@ def fetch_term_and_column_attributes_for_embedding(
             s.catalog_column.c.is_unique,
             s.catalog_table.c.id.label("table_id"),
             s.catalog_table.c.name.label("table_name"),
+            s.catalog_table.c.table_type,
             s.column_attribute.c.id,
+            s.column_attribute.c.certified,
         )
         .select_from(
             s.column_attribute__term.join(
@@ -1156,6 +1397,8 @@ def fetch_column_attribute_embedding_contexts_by_column_id(
             s.term.c.description.label("term_description"),
             s.term.c.synonyms.label("term_synonyms"),
             s.term.c.id.label("term_id"),
+            s.term.c.name_certified.label("term_name_certified"),
+            s.term.c.description_certified.label("term_description_certified"),
             s.catalog_database.c.name.label("database_name"),
             s.column_attribute.c.name,
             s.column_attribute.c.description,
@@ -1167,8 +1410,10 @@ def fetch_column_attribute_embedding_contexts_by_column_id(
             s.catalog_column.c.is_unique,
             s.catalog_table.c.id.label("table_id"),
             s.catalog_table.c.name.label("table_name"),
+            s.catalog_table.c.table_type,
             s.catalog_schema.c.name.label("schema_name"),
             s.column_attribute.c.id,
+            s.column_attribute.c.certified,
         )
         .select_from(
             s.catalog_column.join(
@@ -1212,6 +1457,8 @@ def fetch_column_attribute_embedding_contexts_by_column_id(
                     "synonyms": row["term_synonyms"] or [],
                     "id": term_id,
                     "database_name": row["database_name"] or "",
+                    "name_certified": bool(row["term_name_certified"]),
+                    "description_certified": bool(row["term_description_certified"]),
                 },
                 [],
             )
@@ -1229,6 +1476,7 @@ def fetch_column_attribute_embedding_contexts_by_column_id(
                 "table_name": row["table_name"],
                 "schema_name": row["schema_name"],
                 "id": row["id"],
+                "certified": bool(row["certified"]),
             }
         )
     return list(contexts.values())

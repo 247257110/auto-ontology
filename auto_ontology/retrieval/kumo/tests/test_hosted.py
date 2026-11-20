@@ -152,11 +152,11 @@ def test_related_rows_never_postdate_their_anchor(model):
 
 
 def test_caller_anchor_wins_over_the_end_of_the_data(model):
-    """The caller back-off exists so the window lands inside the data.
+    """A caller-supplied anchor wins, including one before the data's end.
 
-    ``_forecast_anchor`` anchors at ``data_max - (horizon + slack)``; clamping
-    that forward to the last row would put the whole window past every row the
-    warehouse has, which is the degenerate forecast the back-off prevents.
+    The forecast default is today (see ``_forecast_anchor``); clamping an
+    explicit anchor forward to the last row would answer a different moment
+    than the caller asked for.
     """
     spec = model.validate_pql(
         "PREDICT COUNT(invoices.*, 0, 90, days) > 0 FOR EACH customers.customerid"
@@ -434,15 +434,79 @@ def test_a_two_hop_detail_table_is_attributed_through_its_parent(two_hop_model):
     assert any(label > 0 for label in labels), "no instance ever saw a line amount"
 
 
-def test_a_declared_categorical_too_wide_for_the_endpoint_is_sent_as_text():
-    """The endpoint refuses a categorical above 10k values; free text is a string."""
+def test_a_declared_categorical_too_wide_for_the_endpoint_is_left_out():
+    """The endpoint caps categorical at 10k values and reads no `text` type.
+
+    The old fallback declared such a column `text`, but the hosted SDM does not
+    read that semantic type and refuses the whole request with
+    ``422 UNSUPPORTED_DTYPE``. A string column over the ceiling therefore has no
+    declaration the endpoint accepts, and is left out of the payload.
+    """
     from auto_ontology.retrieval.kumo.hosted import _column_spec
 
     wide = pd.Series([f"note {i}" for i in range(15_035)])
     narrow = pd.Series(["gold", "basic"] * 5)
 
-    assert _column_spec(wide, "categorical")["stype"] == "text"
+    assert _column_spec(wide, "categorical") is None
     assert _column_spec(narrow, "categorical")["stype"] == "categorical"
+
+
+def test_a_declared_text_column_is_sent_as_a_category_not_text():
+    """`text` is the local engine's name; the hosted SDM has no such type."""
+    from auto_ontology.retrieval.kumo.hosted import _column_spec
+
+    narrow = pd.Series(["Acme", "Globex"] * 5)
+    wide = pd.Series([f"Acme {i}" for i in range(15_000)])
+
+    assert _column_spec(narrow, "text") == {"dtype": "string", "stype": "categorical"}
+    assert _column_spec(wide, "text") is None
+
+
+def test_a_decimal_measure_is_numerical_not_free_text():
+    """Postgres `numeric` arrives as Decimal/object; it is still a number.
+
+    Read as a string, a measure is declared categorical, dropped once it is
+    wide, and each of its values reaches the endpoint quoted.
+    """
+    from decimal import Decimal
+
+    from auto_ontology.retrieval.kumo.hosted import _column_spec, _scalar
+
+    wide = pd.Series([Decimal(f"{i}.25") for i in range(15_000)], dtype=object)
+
+    assert _column_spec(wide, "text") == {"dtype": "float64", "stype": "numerical"}
+    assert _column_spec(wide, "categorical") == {
+        "dtype": "float64",
+        "stype": "numerical",
+    }
+    assert _scalar(Decimal("1320.39")) == 1320.39
+    assert _scalar(Decimal("NaN")) is None
+
+
+def test_a_decimal_measure_rides_as_a_number_in_the_payload(invoice_frame):
+    """The declaration and the rows agree: float64, not quoted Decimal."""
+    from decimal import Decimal
+
+    frames = {name: frame.copy() for name, frame in invoice_frame.items()}
+    frames["invoices"]["order_total"] = [
+        Decimal(f"{(i % 5) * 10}.25") for i in range(len(frames["invoices"]))
+    ]
+    model = _make_model(frames, col_stypes={"invoices": {"order_total": "text"}})
+
+    payload, _ = _build(
+        model, "PREDICT SUM(invoices.amount, 0, 30, days) FOR EACH customers.customerid"
+    )
+
+    invoices = payload["schema"]["related_tables"]["invoices"]
+    assert invoices["columns"]["order_total"] == {
+        "dtype": "float64",
+        "stype": "numerical",
+    }
+    sent = payload["context"]["related_tables"]["invoices"]
+    at = sent["columns"].index("order_total")
+    values = {row[at] for row in sent["rows"]}
+    assert all(isinstance(value, float) for value in values)
+    assert values == {0.25, 10.25, 20.25, 30.25, 40.25}
 
 
 def test_a_wide_numeric_categorical_is_declared_numerical_not_text():
@@ -463,6 +527,73 @@ def test_a_wide_numeric_categorical_is_declared_numerical_not_text():
 
     assert integers == {"dtype": "int64", "stype": "numerical"}
     assert floats == {"dtype": "float64", "stype": "numerical"}
+
+
+def test_a_declared_text_column_is_declared_categorical_in_the_payload(
+    invoice_frame,
+):
+    """A semantic `text` column must not reach the endpoint as `text`.
+
+    The endpoint answers ``422 UNSUPPORTED_DTYPE: column 'company_name'
+    declares semantic type 'text', which SDM does not read`` and refuses the
+    whole request. Once the sent rows fit under the categorical ceiling there
+    is a declaration it does read, so the column rides as a category.
+    """
+    frames = {name: frame.copy() for name, frame in invoice_frame.items()}
+    frames["customers"]["company_name"] = [f"company {i}" for i in range(1, 13)]
+    model = _make_model(frames, col_stypes={"customers": {"company_name": "text"}})
+
+    payload, _ = _build(
+        model, "PREDICT SUM(invoices.amount, 0, 30, days) FOR EACH customers.customerid"
+    )
+
+    customers = payload["schema"]["related_tables"]["customers"]
+    assert customers["columns"]["company_name"] == {
+        "dtype": "string",
+        "stype": "categorical",
+    }
+    assert "text" not in {
+        str(spec.get("stype")) for spec in customers["columns"].values()
+    }
+    # The rows carry the column the schema declares.
+    sent = payload["context"]["related_tables"]["customers"]
+    at = sent["columns"].index("company_name")
+    assert {row[at] for row in sent["rows"]} == {f"company {i}" for i in range(1, 13)}
+
+
+def test_a_text_column_over_the_categorical_ceiling_is_left_out_of_the_payload(
+    invoice_frame, monkeypatch
+):
+    """A wide free-text column cannot be declared at all, so it is omitted.
+
+    `text` is refused and categorical stops at the ceiling; resending cannot
+    fix either. Leaving the column out keeps the question askable, and the
+    schema and both sent frames must agree about it.
+    """
+    import auto_ontology.retrieval.kumo.hosted as hosted
+
+    monkeypatch.setattr(hosted, "_MAX_CATEGORICAL", 5)
+    frames = {name: frame.copy() for name, frame in invoice_frame.items()}
+    frames["customers"]["company_name"] = [f"company {i}" for i in range(1, 13)]
+    model = _make_model(frames, col_stypes={"customers": {"company_name": "text"}})
+
+    payload, _ = _build(
+        model, "PREDICT SUM(invoices.amount, 0, 30, days) FOR EACH customers.customerid"
+    )
+
+    customers = payload["schema"]["related_tables"]["customers"]
+    assert "company_name" not in customers["columns"]
+    assert all(
+        column != "company_name"
+        for column in payload["context"]["related_tables"]["customers"]["columns"]
+    )
+    assert all(
+        column != "company_name"
+        for column in payload["predict"]["related_tables"]["customers"]["columns"]
+    )
+    for section in ("context", "predict"):
+        table = payload[section]["related_tables"]["customers"]
+        assert all(len(row) == len(table["columns"]) for row in table["rows"])
 
 
 def _shape_rejection(limit: int, cardinality: int = 12_960) -> RuntimeError:
@@ -567,6 +698,33 @@ def test_a_shape_rejection_never_drops_a_joined_column(invoice_frame, monkeypatc
         invoices = body["schema"]["related_tables"]["invoices"]
         assert "customerid" in invoices["columns"]
         assert body["schema"]["relationships"], "the entity relationship was dropped"
+
+
+def test_hosted_semantic_validation_drops_only_the_named_optional_feature(
+    invoice_frame, monkeypatch
+):
+    model = _make_model(invoice_frame)
+    payload, _ = _build(
+        model,
+        "PREDICT SUM(invoices.amount, 0, 30, days) FOR EACH customers.customerid",
+    )
+    sent: list[dict] = []
+
+    def fake_post(body):
+        sent.append(body)
+        if len(sent) == 1:
+            raise RuntimeError(
+                "hosted prediction failed (422): column 'category' declares semantic type text"
+            )
+        return {"predictions": [{"row_index": 0, "prediction": 3.0}]}
+
+    monkeypatch.setattr(model, "_post", fake_post)
+    response = model._predict_response(payload)
+
+    assert response["predictions"]
+    assert len(sent) == 2
+    assert "category" not in sent[1]["schema"]["related_tables"]["customers"]["columns"]
+    assert "customerid" in sent[1]["schema"]["related_tables"]["customers"]["columns"]
 
 
 def test_a_customer_who_did_not_order_is_labelled_true_for_the_zero_case():

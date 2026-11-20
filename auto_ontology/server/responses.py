@@ -96,6 +96,7 @@ __all__ = [
     "IdResponse",
     "JsonObject",
     "ListResponse",
+    "ModelConsistencyResponse",
     "ModelImportResponse",
     "ObjectPageResponse",
     "PagedListResponse",
@@ -236,6 +237,41 @@ class ConnectionTestResponse(_Payload):
 class ModelImportResponse(_Payload):
     success: bool
     summary: JsonObject
+
+
+class ModelConsistencyResponse(_Payload):
+    """What the exported Ossie document would hide from a reader.
+
+    ``counts`` is keyed by severity; ``shape`` states what was checked, so an
+    empty ``findings`` reads as "checked 62 datasets" rather than "did nothing".
+    """
+
+    ok: bool
+    counts: Counts
+    shape: Shape
+    findings: list[Finding]
+
+
+class Counts(_Payload):
+    error: int = 0
+    warning: int = 0
+    info: int = 0
+
+
+class Shape(_Payload):
+    datasets: int = 0
+    fields: int = 0
+    relationships: int = 0
+    metrics: int = 0
+
+
+class Finding(_Payload):
+    severity: str
+    code: str
+    subject: str
+    message: str
+    line: int | None = None
+    detail: JsonObject | None = None
 
 
 class SchemasPayload(_Payload):

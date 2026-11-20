@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -36,6 +37,12 @@ from auto_ontology.catalog.constants import Labels
 
 from auto_ontology.semantic.constants import LABEL_SQL_ATTRIBUTE
 from auto_ontology.semantic.chinese import normalize_chinese_text
+from auto_ontology.semantic.relation_kind import (
+    KIND_TABLE,
+    infer_from_text,
+    is_reference_relation,
+)
+from auto_ontology.retrieval.data_access.reranking import rerank_component
 
 if TYPE_CHECKING:
     from auto_ontology.utils.retriever import Retriever
@@ -62,6 +69,32 @@ PER_LABEL_LIMITS: dict[str, int] = {
 # multilingual embedding can rank below a semantically similar distractor.
 HYBRID_FETCH_MULTIPLIER = 3
 _ASCII_TOKEN_RE = re.compile(r"[a-z0-9_]+", re.IGNORECASE)
+
+# Rank bonus applied to certified semantic nodes (Term / ColumnAttribute /
+# SqlAttribute) inside the hybrid fusion. It is measured in the same units as
+# ``_lexical_score`` (0..2) and kept well below a full substring match (1.0),
+# so certification breaks ties and near-ties without overriding a genuinely
+# better lexical match.
+CERTIFIED_RANK_BONUS = 0.25
+
+# Rank penalty for a relation that *references* facts rather than being one —
+# a view (``website.customers``) or a purged-history table
+# (``customers_archive``). Analysing through a view picks someone else's join
+# and filter; joining an archive duplicates every entity with more than one
+# version, so a customer count doubles without anything failing.
+#
+# Sized above ``CERTIFIED_RANK_BONUS`` so a certified definition on an archive
+# does not outrank a plain column on a live table at equal lexical evidence —
+# certified means "this wording is right", not "this relation is the source".
+# Still well below an exact lexical match, so a question that *names* the
+# archive ("冷库温度历史", "变更历史") keeps it: 1.0 - 0.45 still beats 0.
+#
+# A soft penalty, not an exclusion, because two live cases need these rows:
+# ``coldroomtemperatures_archive`` is the only place WWI keeps temperature
+# history (the live table has 4 rows), and ``v_customer_last_order`` is a
+# view built precisely to answer a recency question. Operators who find it
+# mis-sized set ``RETRIEVAL_REFERENCE_PENALTY=0`` and are back to the old order.
+REFERENCE_RELATION_PENALTY = 0.45
 
 # ``retriever.query`` embeds the entity text via the remote NIM embeddings
 # endpoint before it can run the vector search — a transient 5xx there
@@ -214,23 +247,115 @@ def _lexical_score(query: str, row: dict) -> float:
     return min(score, 2.0)
 
 
+def _reference_penalty() -> float:
+    """The downrank applied to views and archives, read per call.
+
+    Separate from the constant so a deployment can switch it off (or reshape it)
+    without a code change — see the trade-off note on
+    ``REFERENCE_RELATION_PENALTY``.
+    """
+    raw = os.environ.get("RETRIEVAL_REFERENCE_PENALTY")
+    if raw is None or not raw.strip():
+        return REFERENCE_RELATION_PENALTY
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "RETRIEVAL_REFERENCE_PENALTY=%r is not a number; using %s",
+            raw,
+            REFERENCE_RELATION_PENALTY,
+        )
+        return REFERENCE_RELATION_PENALTY
+
+
+def _exempt_relations() -> set[str]:
+    """Relations that must never be demoted, from the environment.
+
+    Comma-separated table or term names. Exists because one relation can be both
+    things: Wide World Importers keeps its live ``coldroomtemperatures`` table
+    at 4 rows and the whole temperature history in
+    ``coldroomtemperatures_archive``, so the archive *is* the fact source for a
+    threshold question. Name conventions cannot tell that case apart from
+    ``customers_archive``, and reading row counts at retrieval time would cost a
+    database round trip per question — so the deployment, which knows, says so.
+    """
+    raw = os.environ.get("RETRIEVAL_REFERENCE_EXEMPT", "")
+    return {
+        part.strip().casefold()
+        for part in raw.replace(";", ",").split(",")
+        if part.strip()
+    }
+
+
+def _row_relation_kind(row: dict) -> str:
+    """A row's relation kind, from its metadata or from the names it carries.
+
+    Rows embedded before the flag existed fall back to the names: a
+    ColumnAttribute always has its physical ``table_name``, and a Term compiled
+    from an archive table is called "Archived City". Only archives are
+    inferable this way — a view leaves no trace, and demoting one on a guess
+    would be worse than leaving it where it ranks now.
+
+    ``RETRIEVAL_REFERENCE_EXEMPT`` wins over both, for the relation that is a
+    reference by name and a fact source in practice.
+    """
+    exempt = _exempt_relations()
+    if exempt:
+        for value in (row.get("table_name"), row.get("name")):
+            if value and str(value).strip().casefold() in exempt:
+                return KIND_TABLE
+
+    embedded = row.get("relation_kind")
+    if embedded:
+        return str(embedded)
+    return infer_from_text(row.get("table_name"), row.get("name"))
+
+
 def _hybrid_rank_rows(
-    query: str, rows: list[dict], per_label_k: "int | dict[str, int]"
+    query: str,
+    rows: list[dict],
+    per_label_k: "int | dict[str, int]",
+    rerank_bonus: "dict[str, float] | None" = None,
 ) -> list[dict]:
     """Fuse vector ordering with deterministic lexical evidence.
 
     Vector distance remains the primary signal. Lexical evidence only breaks
-    close semantic ties and makes aliases/exact Chinese wording observable.
+    close semantic ties and makes aliases/exact Chinese wording observable, and
+    a certified node gets a modest boost on top (see ``CERTIFIED_RANK_BONUS``).
+
+    *rerank_bonus* is an optional ``{id: bonus}`` from a cross-encoder (see
+    ``reranking.rerank_component``). It is **added** to the same sum rather than
+    replacing the order, so a reranker can settle a close call but cannot erase
+    a lexical match or a certification. Absent or empty, the fusion is exactly
+    what it was.
     """
     if not rows:
         return []
+    bonuses = rerank_bonus or {}
+    penalty = _reference_penalty()
     ranked: list[tuple[float, int, dict]] = []
     for index, row in enumerate(rows):
         lexical = _lexical_score(query, row)
         row["lexical_score"] = lexical
         # Distance is not calibrated across backends; a rank-based vector
         # component keeps this fusion stable while lexical matches are strong.
-        ranked.append((index - lexical * len(rows), index, row))
+        # A certified node gets a modest boost (see CERTIFIED_RANK_BONUS) so
+        # vetted semantics win ties and near-ties.
+        certified = CERTIFIED_RANK_BONUS if row.get("certified") else 0.0
+        semantic = bonuses.get(str(row.get("id")), 0.0)
+        if semantic:
+            row["rerank_bonus"] = semantic
+        reference = 0.0
+        if penalty and is_reference_relation(_row_relation_kind(row)):
+            reference = penalty
+            row["reference_penalty"] = reference
+        ranked.append(
+            (
+                index - (lexical + certified + semantic - reference) * len(rows),
+                index,
+                row,
+            )
+        )
     ranked.sort(key=lambda item: item[0])
 
     counts: dict[str, int] = {}
@@ -369,6 +494,8 @@ def _hits_to_semantic_rows(
             "source",
             "source_column",
             "synonyms",
+            "certified",
+            "relation_kind",
         ):
             val = meta.get(_field)
             if val is not None:
@@ -431,4 +558,7 @@ def search_semantic_index(
         label_filter=allowed_labels,
         per_label_k=candidate_k or PER_LABEL_LIMIT * HYBRID_FETCH_MULTIPLIER,
     )
-    return _hybrid_rank_rows(entity, rows, per_label_k)
+    # One cross-encoder call over the fused candidate pool. Empty when the
+    # reranker is off, the query's script is not enabled, or the call failed —
+    # all of which leave the fusion exactly as it was.
+    return _hybrid_rank_rows(entity, rows, per_label_k, rerank_component(entity, rows))

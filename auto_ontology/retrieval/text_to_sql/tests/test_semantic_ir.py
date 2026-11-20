@@ -133,3 +133,19 @@ def test_unresolved_metric_produces_one_focused_chinese_question() -> None:
         "暂未找到指标“客户收入”的明确治理定义。请补充该指标的业务含义、"
         "对应字段，或提供计算公式后再查询。"
     )
+
+
+def test_dimension_phrases_drop_counters_and_verb_phrases() -> None:
+    """``按客户类别统计订单数`` is the dimension 客户类别, not 客户类别统计."""
+    from auto_ontology.retrieval.text_to_sql.semantic_ir import build_semantic_ir
+
+    def dimensions(question: str) -> list[str]:
+        return build_semantic_ir(
+            question, question_type="calculation", calculation_subtype="aggregation"
+        ).dimensions
+
+    assert dimensions("查询最近12个月每个地区的营收") == ["地区"]
+    assert dimensions("按客户类别统计订单数") == ["客户类别"]
+    assert dimensions("每个销售员的营收") == ["销售员"]
+    assert dimensions("按品类看毛利率") == ["品类"]
+    assert dimensions("各地区客户数") == ["地区"]

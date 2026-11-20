@@ -1576,15 +1576,21 @@ def _forecast_anchor(
     now: Any = None,
     table_names: dict[str, str] | None = None,
 ) -> Any:
-    """Anchor a forward prediction at *now* (a true "forecast from today"), capped so the
-    ``[anchor, anchor + horizon]`` window never runs past the data.
+    """Anchor a forward prediction at *now* — a true forecast from today.
 
-    KumoRFM derives its default anchor from the data's MAX timestamp. On a dataset whose data extends past
-    today that makes it forecast a window with no in-context future and return degenerate (collapsed or
-    wildly over-extrapolated) predictions. Anchoring at *now* lands the window inside real data; the cap
-    keeps it valid even when *now* is already at/after the data's edge. Returns a ``pd.Timestamp`` for
-    ``anchor_time``, or ``None`` to let the SDK derive it (non-temporal query / unknown horizon / no time
-    column / lookup failure)."""
+    KumoRFM's default anchor is the data's MAX timestamp, which answers "the
+    next 90 days" as they looked from the last row, not from today. The
+    prediction window is the future, so it deliberately is *not* capped to
+    where the data stops: a warehouse that ends today still forecasts from
+    today, with no observed labels inside the window. (The old cap backed the
+    anchor off by ``horizon + 7`` days to keep the window inside observed
+    data, which silently turned "next 90 days" into "90 days from last
+    spring".) Callers that need a historical backtest can pass an explicit
+    anchor; this helper is only the default.
+
+    Returns a ``pd.Timestamp`` for ``anchor_time``, or ``None`` to let the SDK
+    derive it (non-temporal query / unknown horizon / no time column).
+    """
     if not time_columns:
         return None
     tm = _ANCHOR_TABLE_RE.search(pql or "")
@@ -1592,10 +1598,39 @@ def _forecast_anchor(
     if not tm or not wm:
         return None
     anchor_table = unquote_name(tm.group(1))
+    if not time_columns.get(anchor_table):
+        return None
+    import pandas as pd
+
+    return (
+        pd.Timestamp(now)
+        if now is not None
+        else pd.Timestamp(pd.Timestamp.today().date())
+    )
+
+
+def _data_edge(
+    pql: str,
+    connector: SQLDatabase,
+    time_columns: dict[str, str | None] | None,
+    *,
+    table_names: dict[str, str] | None = None,
+) -> Any:
+    """The newest timestamp the anchor table actually holds, or ``None``.
+
+    The anchor itself is today (see :func:`_forecast_anchor`); this is only
+    used to warn when the warehouse has stopped being loaded, so the reader
+    knows the forecast extrapolates from stale history.
+    """
+    if not time_columns:
+        return None
+    tm = _ANCHOR_TABLE_RE.search(pql or "")
+    if not tm:
+        return None
+    anchor_table = unquote_name(tm.group(1))
     time_col = time_columns.get(anchor_table)
     if not time_col:
         return None
-    horizon_days = int(wm.group(1)) * _ANCHOR_UNIT_DAYS[wm.group(2).lower()]
     try:
         import pandas as pd
 
@@ -1603,22 +1638,11 @@ def _forecast_anchor(
             f"SELECT MAX({quote_ident(time_col)}) AS m "
             f"FROM {_sql_table(anchor_table, table_names)}"
         )
-        data_max = (
-            pd.Timestamp(df.iloc[0, 0])
-            if (not df.empty and df.iloc[0, 0] is not None)
-            else None
-        )
-    except Exception:  # noqa: BLE001 - anchor is best-effort; fall back to the SDK default
+    except Exception:  # noqa: BLE001 - the note is best-effort
         return None
-    if data_max is None:
+    if df.empty or df.iloc[0, 0] is None:
         return None
-    safe = data_max - pd.Timedelta(days=horizon_days + 7)
-    now_ts = (
-        pd.Timestamp(now)
-        if now is not None
-        else pd.Timestamp(pd.Timestamp.today().date())
-    )
-    return min(now_ts, safe)
+    return pd.Timestamp(df.iloc[0, 0])
 
 
 _STALE_ANCHOR_DAYS = 31
@@ -1630,31 +1654,29 @@ def _join_notes(*notes: str | None) -> str | None:
     return "\n\n".join(kept) if kept else None
 
 
-def _stale_anchor_note(anchor: Any, *, now: Any = None) -> str | None:
-    """Say when a forward prediction is not anchored anywhere near today.
+def _stale_data_note(data_edge: Any, *, now: Any = None) -> str | None:
+    """Say when the warehouse's newest row is far behind today.
 
-    KumoRFM anchors within the data, so a warehouse that stopped being loaded
-    pulls the window back to where the data ends. The prediction is still the
-    best one the data supports, but it answers "the next 30 days" as they looked
-    from that date, and a reader who is not told reads it as the next 30 days
-    from now.
+    The forecast is still anchored at today, but it extrapolates from a history
+    that stopped ``behind`` days ago. A reader who is not told reads the result
+    as based on current activity.
     """
-    if anchor is None:
+    if data_edge is None:
         return None
     import pandas as pd
 
-    anchored = pd.Timestamp(anchor)
+    newest = pd.Timestamp(data_edge)
     today = (
         pd.Timestamp(now)
         if now is not None
         else pd.Timestamp(pd.Timestamp.today().date())
     )
-    behind = (today - anchored).days
+    behind = (today - newest).days
     if behind <= _STALE_ANCHOR_DAYS:
         return None
     return (
-        f"这次预测锚定在 {anchored.date()}，也就是 {behind:,} 天前 —— "
-        f"因为数据只到这里。它是以那一天为起点做的预测，不是从今天起算的。"
+        f"数据截止到 {newest.date()}，也就是 {behind:,} 天前；"
+        f"预测仍以今天为锚点，但最近这段历史是缺失的。"
     )
 
 
@@ -2002,7 +2024,14 @@ def generate_pql(
                 _anchor = _forecast_anchor(
                     pql, connector, time_columns, table_names=table_names
                 )
-                result.note = _join_notes(result.note, _stale_anchor_note(_anchor))
+                result.note = _join_notes(
+                    result.note,
+                    _stale_data_note(
+                        _data_edge(
+                            pql, connector, time_columns, table_names=table_names
+                        )
+                    ),
+                )
 
                 def _explain_call(num_neighbors: list[int] | None) -> Any:
                     kw: dict[str, Any] = {"explain": True, "run_mode": "fast"}
@@ -2088,7 +2117,14 @@ def generate_pql(
                 _anchor = _forecast_anchor(
                     pql, connector, time_columns, table_names=table_names
                 )
-                result.note = _join_notes(result.note, _stale_anchor_note(_anchor))
+                result.note = _join_notes(
+                    result.note,
+                    _stale_data_note(
+                        _data_edge(
+                            pql, connector, time_columns, table_names=table_names
+                        )
+                    ),
+                )
 
                 def _predict_call(
                     idx: list[Any] | None, num_neighbors: list[int] | None
@@ -2171,9 +2207,7 @@ def generate_pql(
         except Exception as exc:  # noqa: BLE001 - error feeds the repair loop
             prev_pql, prev_error = pql, str(exc)
             result.error = prev_error
-            logger.info(
-                "PQL attempt %d/%d failed: %s", attempt, max_tries, prev_error[:160]
-            )
+            logger.info("PQL attempt %d/%d failed: %s", attempt, max_tries, prev_error)
             if _is_cardinality_shape_error(prev_error):
                 # The client already dropped the widest columns; a regenerated PQL would be
                 # rejected by the same ceiling, so report instead of spending the remaining attempts.

@@ -202,6 +202,7 @@
     "delete_sql_attribute_node": "(attr_id: 'str') -> 'None'",
     "detach_existing_sql_edges": "(attr_id: 'str') -> 'None'",
     "fetch_sql_attribute_counts": "(zone_ids: 'list[str] | None' = None, data_ids_by_zone: 'dict[str, set[str]] | None' = None, term_ids: 'list[str] | None' = None) -> 'list[dict[str, Any]]'",
+    "fetch_sql_attribute_databases": "(attr_ids: 'list[str]') -> 'dict[str, str]'",
     "fetch_sql_attribute_docs": "(attr_id: 'str') -> 'list[dict[str, Any]]'",
     "fetch_sql_attributes_by_term_id": "(term_id: 'str', zone_ids: 'list[str] | None' = None, *, skip: 'int' = 0, limit: 'int | None' = None) -> 'list[dict[str, Any]]'",
     "fetch_sql_attributes_with_sql": "(attr_ids: 'list[str]') -> 'list[dict[str, str]]'",
@@ -248,9 +249,11 @@
     "replace_term_families": "(database_name: 'str', families: 'Iterable[tuple[str, str, Mapping[str, str]]]') -> 'int'"
   },
   "terms": {
+    "TermNameConflict": "class(ValueError)",
     "build_term_table_maps": "(pairs: 'list[dict[str, Any]]') -> 'tuple[dict[str, set[str]], dict[str, set[str]]]'",
     "count_column_attributes_by_term_id": "(term_id: 'str', zone_ids: 'list[str] | None' = None) -> 'int'",
     "count_terms": "(zone_ids: 'list[str] | None' = None, search: 'str | None' = None, data_ids_by_zone: 'dict[str, set[str]] | None' = None) -> 'int'",
+    "create_term": "(*, name: 'str', description: 'str | None' = None, synonyms: 'list[str] | None' = None, table_ids: 'list[str]', name_certified: 'bool' = False, description_certified: 'bool' = False, owner_id: 'str | None' = None, created_by: 'str | None' = None) -> 'dict[str, Any]'",
     "fetch_all_terms": "(zone_ids: 'list[str] | None' = None, search: 'str | None' = None, data_ids_by_zone: 'dict[str, set[str]] | None' = None, *, skip: 'int' = 0, limit: 'int | None' = None) -> 'list[dict[str, Any]]'",
     "fetch_all_terms_and_attributes": "(zone_ids: 'list[str] | None' = None) -> 'tuple[list[dict[str, Any]], list[dict[str, Any]]]'",
     "fetch_column_attribute_counts": "(zone_ids: 'list[str] | None' = None, data_ids_by_zone: 'dict[str, set[str]] | None' = None, term_ids: 'list[str] | None' = None) -> 'list[dict[str, Any]]'",
@@ -264,6 +267,7 @@
     "fetch_term_synonyms": "(attr_ids: 'list[str]') -> 'dict[str, list[str]]'",
     "fetch_term_table_pairs": "(zone_ids: 'list[str] | None' = None, data_ids_by_zone: 'dict[str, set[str]] | None' = None, database_name: 'str | None' = None, *, term_ids: 'list[str] | None' = None, table_ids: 'list[str] | None' = None) -> 'list[dict[str, Any]]'",
     "fetch_term_zones_map": "(zone_ids: 'list[str] | None' = None, term_ids: 'list[str] | None' = None) -> 'dict[str, list[dict[str, Any]]]'",
+    "fetch_terms_and_attributes_for_database": "(database_name: 'str') -> 'tuple[list[dict[str, Any]], list[dict[str, Any]]]'",
     "fetch_terms_and_attributes_for_table": "(table_id: 'str') -> 'tuple[list[dict[str, Any]], list[dict[str, Any]]]'",
     "fetch_terms_by_ids": "(term_ids: 'list[str]', *, skip: 'int' = 0, limit: 'int | None' = None) -> 'list[dict[str, Any]]'",
     "fetch_terms_with_sqls": "(source: 'str' = 'semantic', database_name: 'str | None' = None) -> 'list[dict[str, Any]]'",

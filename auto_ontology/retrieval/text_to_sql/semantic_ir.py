@@ -231,17 +231,47 @@ def _metric_specs(question: str, metrics: list[str]) -> list[SemanticMetric]:
     return specs
 
 
+# A classifier between "每"/"各" and the noun it counts: "每个地区" is the
+# dimension 地区, not 个地区. Left in, the counter becomes part of the phrase and
+# grounding scores it against ontology objects that mention a count.
+_DIMENSION_COUNTERS = "个|家|种|类|位|名|条|笔|张|份|项"
+
+
+# Words that end a dimension phrase more often than they belong to one:
+# "按客户类别统计订单数" is the dimension 客户类别, and "按品类看毛利率" is 品类.
+# Truncated at the first one rather than stripped, since the rest is a verb
+# phrase about the metric, not part of the noun.
+_DIMENSION_STOPWORDS = (
+    "统计数据",
+    "统计",
+    "计算",
+    "来看",
+    "看",
+    "分别",
+    "得到",
+    "汇总",
+    "排名",
+    "排序",
+    "的",
+)
+
+
 def _dimension_phrases(question: str) -> list[str]:
     metric_lookahead = "|".join(_METRIC_TERMS)
     match = re.search(
-        rf"(?:按|按照|依|以|各|每)\s*"
+        rf"(?:按|按照|依|以|各|每)\s*(?:{_DIMENSION_COUNTERS})?\s*"
         rf"([\u4e00-\u9fffA-Za-z][\u4e00-\u9fffA-Za-z0-9_]{{1,15}}?)"
         rf"(?=(?:客户|用户|订单|{metric_lookahead}|最高|最低|$))",
         question,
     )
     if not match:
         return []
-    value = match.group(1).strip("的").strip()
+    value = match.group(1)
+    for stopword in _DIMENSION_STOPWORDS:
+        index = value.find(stopword)
+        if index > 0:
+            value = value[:index]
+    value = value.strip("的").strip()
     return [value] if value else []
 
 

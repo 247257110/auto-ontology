@@ -1148,7 +1148,7 @@ def _build_context_within_budget(
     covered = _apply_join_paths(graph, join_paths)
     if covered:
         logger.info("kumo: using %d catalog join edge(s)", covered)
-    elif hosted is None:
+    if hosted is None and not covered:
         # No usable catalog join paths — fall back to KumoRFM's link heuristics.
         logger.info("kumo: no catalog join paths; inferring links heuristically")
         try:
@@ -1158,12 +1158,12 @@ def _build_context_within_budget(
             logger.exception(
                 "kumo: infer_links failed; proceeding without inferred links"
             )
-    else:
+    elif hosted is not None:
         from auto_ontology.retrieval.kumo.framed_graph import infer_links_by_name
 
         inferred = infer_links_by_name(graph, frames)
         logger.info(
-            "kumo: no catalog join paths; inferred %d link(s) by matching keys",
+            "kumo: hosted graph supplemented with %d conservative link(s) by matching keys",
             inferred,
         )
 

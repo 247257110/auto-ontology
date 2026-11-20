@@ -23,6 +23,17 @@ classifier reach for different tables if it judges the data to be elsewhere.
 An empty result can legitimately be the correct answer, so the retry is
 one-shot and never rejects the regenerated query for also coming back empty —
 the cost of being wrong here is one extra reconstruction, not a lost answer.
+
+**Zero rows is not always a bug.** Before spending that retry, the node asks
+``classify_empty_result`` whether the emptiness is explained by the data: if
+every filter literal was checked against a column small enough to list, and the
+value asked for is simply not among that column's values, then no regeneration
+can produce rows and the zero *is* the answer. That verdict is recorded in
+``path_state["empty_result"]`` and carried into the reply, so a legitimately
+empty answer arrives as "this value does not occur in the data" rather than as
+an unexplained blank. Only columns whose whole value set is known qualify — a
+missing value on a high-cardinality column usually means the value lives in a
+different column or table, which is exactly what the retry is for.
 """
 
 from __future__ import annotations
@@ -40,6 +51,7 @@ from auto_ontology.retrieval.text_to_sql.connector_routing import (
 from auto_ontology.retrieval.text_to_sql.db_probe.executor import ProbeExecutor
 from auto_ontology.retrieval.text_to_sql.db_probe.literal_check import (
     build_value_repair_error,
+    classify_empty_result,
     find_literal_mismatches,
     find_numeric_scale_mismatches,
 )
@@ -95,6 +107,7 @@ class EmptyResultValueRepairAgent(BaseAgent):
             return {"decision": "valid_sql", "path_state": path_state}
 
         mismatches: list[dict[str, Any]] = []
+        verdict = None
         if path_state.get("value_repair_attempted"):
             self.logger.info("Value repair already attempted — skipping the probe")
         else:
@@ -103,13 +116,27 @@ class EmptyResultValueRepairAgent(BaseAgent):
             connector = resolve_connector_from_tables(relevant_tables, connectors)
             dialect = getattr(connector, "dialect", None)
 
+            # One cache across both calls: they probe the same columns, and
+            # paying for two DISTINCT scans of the same column to answer one
+            # question about an empty result would be silly.
+            distinct_cache: dict[Any, Any] = {}
             with ProbeExecutor(connector) as executor:
                 # Reached only when the query came back empty, so the extra
                 # high-cardinality literal check is warranted here (and only here).
                 mismatches = find_literal_mismatches(
-                    executor, dialect, sql_code, result_was_empty=True
+                    executor,
+                    dialect,
+                    sql_code,
+                    result_was_empty=True,
+                    distinct_cache=distinct_cache,
                 )
                 mismatches += find_numeric_scale_mismatches(executor, dialect, sql_code)
+                # Only when there is nothing to repair is it worth asking
+                # whether the zero rows are simply the truth.
+                if not mismatches:
+                    verdict = classify_empty_result(
+                        executor, dialect, sql_code, distinct_cache=distinct_cache
+                    )
 
         if mismatches:
             path_state["value_repair_attempted"] = True
@@ -131,6 +158,20 @@ class EmptyResultValueRepairAgent(BaseAgent):
         if path_state.get("empty_result_retry_attempted"):
             self.logger.info(
                 "Empty result persisted after an undiagnosed retry — passing through"
+            )
+            return {"decision": "valid_sql", "path_state": path_state}
+
+        # The data holds a closed set of values for every filtered column and
+        # none of them is what the question asked for. Regenerating cannot
+        # change that, so answer the zero instead of spending a reconstruction
+        # round trip to reach the same empty result.
+        if verdict is not None and verdict.is_data_fact:
+            path_state["value_repair_attempted"] = True
+            path_state["empty_result"] = verdict.as_dict()
+            self.logger.info(
+                "[%s] Empty result is a data fact — answering without a retry: %s",
+                path_state.get("task_id", "?"),
+                [f"{item.column}='{item.used}'" for item in verdict.absent_values()],
             )
             return {"decision": "valid_sql", "path_state": path_state}
 

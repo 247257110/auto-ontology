@@ -4,15 +4,20 @@
 
 """Proactive (pre-execution) value check.
 
-Optional variant of the value-repair signal, gated by ``DB_PROBE_PROACTIVE``.
+Gated by ``DB_PROBE_PROACTIVE``, which is **on by default** as the ``values``
+mode (see :func:`~auto_ontology.retrieval.text_to_sql.db_probe.config.proactive_mode`).
 Unlike the post-execution empty-result check, this runs *before* execution and
 regardless of the (not-yet-known) result, so it also catches wrong literals that
 would return non-empty-but-wrong rows — including a numeric threshold that's
 merely on the wrong scale (e.g. a percent vs. fraction mismatch), which a
 non-empty-but-wrong result would otherwise hide. It costs a few cheap
 ``DISTINCT``/``MIN``/``MAX`` probes on every query that has a categorical
-equality/IN filter or a numeric comparison filter, which is why it is opt-in.
+equality/IN filter or a numeric comparison filter, all bounded by
+``DB_PROBE_MAX_CALLS`` and cached per distinct column within the run.
 Runs at most once per request (guarded) to avoid reconstruction loops.
+
+The numeric-scale heuristic is the one part that stays opt-in
+(``DB_PROBE_PROACTIVE=all``); see the note at its call site.
 """
 
 from __future__ import annotations
@@ -34,6 +39,9 @@ from auto_ontology.retrieval.text_to_sql.db_probe.literal_check import (
     find_literal_mismatches,
     find_numeric_scale_mismatches,
     try_self_apply_integer_division_fixes,
+)
+from auto_ontology.retrieval.text_to_sql.db_probe.config import (
+    is_db_probe_numeric_scale,
 )
 from auto_ontology.retrieval.text_to_sql.state import AgentState
 
@@ -85,7 +93,12 @@ class ProactiveValueCheckAgent(BaseAgent):
 
         with ProbeExecutor(connector) as executor:
             mismatches = find_literal_mismatches(executor, dialect, sql_code)
-            mismatches += find_numeric_scale_mismatches(executor, dialect, sql_code)
+            # The scale heuristic stays opt-in (``DB_PROBE_PROACTIVE=all``): it
+            # infers a unit mismatch from an out-of-range literal, so a wrong
+            # guess rejects a query that was right. Literal matching above is
+            # evidence-backed — it only fires when a real value near-matches.
+            if is_db_probe_numeric_scale():
+                mismatches += find_numeric_scale_mismatches(executor, dialect, sql_code)
         mismatches += find_integer_division_mismatches(
             dialect, sql_code, known_types=known_types
         )

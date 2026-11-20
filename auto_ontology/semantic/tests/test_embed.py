@@ -68,3 +68,48 @@ def test_an_undocumented_column_embeds_its_name_and_samples() -> None:
     assert _attr_text(sample_values='["a"]') == (
         "ColumnAttribute: Total of Term Order.  Sample values: a."
     )
+
+
+def test_a_certified_attribute_is_flagged_in_metadata() -> None:
+    (row,) = _build_rows(
+        "shop",
+        {},
+        [
+            {
+                "id": "a1",
+                "name": "Total",
+                "term_name": "Order",
+                "source_column": "total",
+                "certified": True,
+            }
+        ],
+    )
+    assert row["metadata"]["certified"] is True
+    assert row["metadata"]["content_metadata"]["certified"] is True
+
+
+def test_an_uncertified_attribute_carries_no_certified_flag() -> None:
+    (row,) = _build_rows(
+        "shop",
+        {},
+        [
+            {
+                "id": "a1",
+                "name": "Total",
+                "term_name": "Order",
+                "source_column": "total",
+            }
+        ],
+    )
+    assert "certified" not in row["metadata"]
+
+
+def test_a_term_is_certified_only_when_name_and_description_are() -> None:
+    from auto_ontology.semantic.embed import _term_certified
+
+    assert _term_certified({"name_certified": True, "description_certified": True})
+    assert not _term_certified({"name_certified": True, "description_certified": False})
+    assert not _term_certified({"name_certified": False, "description_certified": True})
+    assert not _term_certified({})
+    assert _term_certified({"certified": True})
+    assert not _term_certified({"certified": False})

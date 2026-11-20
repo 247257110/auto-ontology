@@ -958,6 +958,28 @@
         "title": "ConnectionTestResponse",
         "type": "object"
       },
+      "Counts": {
+        "additionalProperties": true,
+        "properties": {
+          "error": {
+            "default": 0,
+            "title": "Error",
+            "type": "integer"
+          },
+          "info": {
+            "default": 0,
+            "title": "Info",
+            "type": "integer"
+          },
+          "warning": {
+            "default": 0,
+            "title": "Warning",
+            "type": "integer"
+          }
+        },
+        "title": "Counts",
+        "type": "object"
+      },
       "CustomAnalysis": {
         "additionalProperties": true,
         "description": "A verified SQL example, joined with the text of its ``Sql`` node.",
@@ -2071,6 +2093,58 @@
         "title": "ExportRequest",
         "type": "object"
       },
+      "Finding": {
+        "additionalProperties": true,
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "line": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Line"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "severity": {
+            "title": "Severity",
+            "type": "string"
+          },
+          "subject": {
+            "title": "Subject",
+            "type": "string"
+          }
+        },
+        "required": [
+          "severity",
+          "code",
+          "subject",
+          "message"
+        ],
+        "title": "Finding",
+        "type": "object"
+      },
       "ForeignKeyRef": {
         "additionalProperties": true,
         "description": "One foreign-key column pair behind an exploration edge.\n\n``source_column`` always names a column on the edge's ``source``. The\nsample values are rendered through ``stringify_sample_values`` before\nreaching this model, so the types a column stores arrive here as a plain\nstring list.",
@@ -2833,6 +2907,37 @@
           "count"
         ],
         "title": "ListResponse[Zone]",
+        "type": "object"
+      },
+      "ModelConsistencyResponse": {
+        "additionalProperties": true,
+        "description": "What the exported Ossie document would hide from a reader.\n\n``counts`` is keyed by severity; ``shape`` states what was checked, so an\nempty ``findings`` reads as \"checked 62 datasets\" rather than \"did nothing\".",
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/Counts"
+          },
+          "findings": {
+            "items": {
+              "$ref": "#/components/schemas/Finding"
+            },
+            "title": "Findings",
+            "type": "array"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "shape": {
+            "$ref": "#/components/schemas/Shape"
+          }
+        },
+        "required": [
+          "ok",
+          "counts",
+          "shape",
+          "findings"
+        ],
+        "title": "ModelConsistencyResponse",
         "type": "object"
       },
       "ModelFormat": {
@@ -3694,6 +3799,59 @@
         "title": "SemanticGraphNode",
         "type": "object"
       },
+      "SemanticReindexRequest": {
+        "properties": {
+          "databases": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Databases"
+          },
+          "dry_run": {
+            "default": false,
+            "title": "Dry Run",
+            "type": "boolean"
+          },
+          "labels": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Labels"
+          },
+          "node_ids": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Node Ids"
+          }
+        },
+        "title": "SemanticReindexRequest",
+        "type": "object"
+      },
       "SemanticStatusResponse": {
         "additionalProperties": true,
         "properties": {
@@ -3735,6 +3893,33 @@
           "last_failure_at"
         ],
         "title": "SemanticStatusResponse",
+        "type": "object"
+      },
+      "Shape": {
+        "additionalProperties": true,
+        "properties": {
+          "datasets": {
+            "default": 0,
+            "title": "Datasets",
+            "type": "integer"
+          },
+          "fields": {
+            "default": 0,
+            "title": "Fields",
+            "type": "integer"
+          },
+          "metrics": {
+            "default": 0,
+            "title": "Metrics",
+            "type": "integer"
+          },
+          "relationships": {
+            "default": 0,
+            "title": "Relationships",
+            "type": "integer"
+          }
+        },
+        "title": "Shape",
         "type": "object"
       },
       "SqlAttribute": {
@@ -5312,6 +5497,74 @@
         "title": "TermCountEntry",
         "type": "object"
       },
+      "TermCreate": {
+        "description": "A Term created by hand rather than by compilation.\n\n``table_ids`` is what makes a *concept* Term possible: \"\u5ba2\u6237\u5730\u57df\" owns no\nsingle table, it spans customers \u2192 cities \u2192 stateprovinces. Every read\nfilters on a Term having at least one represented table, so a Term created\nwith no links would be invisible to the glossary and to retrieval.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "description_certified": {
+            "default": false,
+            "title": "Description Certified",
+            "type": "boolean"
+          },
+          "name": {
+            "minLength": 1,
+            "title": "Name",
+            "type": "string"
+          },
+          "name_certified": {
+            "default": false,
+            "title": "Name Certified",
+            "type": "boolean"
+          },
+          "owner_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Id"
+          },
+          "synonyms": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Synonyms"
+          },
+          "table_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Table Ids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "TermCreate",
+        "type": "object"
+      },
       "TermDetail": {
         "additionalProperties": true,
         "description": "One Term with the tables that represent it and its related terms.\n\n``tags`` is resolved here and on the paged list. The list reads them once\nfor the page, which is what its cards draw.",
@@ -5885,6 +6138,20 @@
               }
             ],
             "title": "Owner Id"
+          },
+          "synonyms": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Synonyms"
           }
         },
         "title": "TermUpdate",
@@ -7918,6 +8185,48 @@
         ]
       }
     },
+    "/api/model/consistency": {
+      "post": {
+        "description": "Report what reading the exported Ossie document cannot reveal.\n\nDangling relationship fields, duplicate metric names, the tables a term was\nnarrowed away from, and the object types Ossie has no place for. Empty\nfindings on a consistent export \u2014 that is what makes it usable as a gate as\nwell as a panel.\n\nSame work as an export (it builds one), so it is on demand rather than on\nthe query path.",
+        "operationId": "check_model_consistency_api_model_consistency_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ExportRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelConsistencyResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Check Model Consistency",
+        "tags": [
+          "model-interchange"
+        ]
+      }
+    },
     "/api/model/export": {
       "post": {
         "description": "Export the scoped catalog + semantic model as a YAML attachment.\n\nWith ``include_ontology``, the Apache Ossie export is a zip that also holds\nthe terms as an Ossie ontology and the mapping onto the semantic model.",
@@ -8810,6 +9119,50 @@
         "summary": "Trigger",
         "tags": [
           "semantic-compilation"
+        ]
+      }
+    },
+    "/api/semantic-index/reindex": {
+      "post": {
+        "description": "Preview (``dry_run=true``) or execute a semantic-layer vector rebuild.\n\n``labels`` defaults to every semantic label (see ``SEMANTIC_LABELS``); pass\nan explicit list to rebuild a subset. ``databases`` scopes the rebuild to\nthose databases; omit it to rebuild all. ``node_ids`` narrows to specific\nnode ids.\n\nA real run refuses loudly when the embedding endpoint is unavailable or\nnothing matched, rather than reporting success.",
+        "operationId": "reindex_api_semantic_index_reindex_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SemanticReindexRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Reindex Api Semantic Index Reindex Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reindex",
+        "tags": [
+          "semantic-index"
         ]
       }
     },
@@ -9735,6 +10088,46 @@
           }
         },
         "summary": "List Terms",
+        "tags": [
+          "terms"
+        ]
+      },
+      "post": {
+        "description": "Create a Term, optionally representing several tables at once.\n\nCompilation only allocates one Term per table, which cannot express a\nconcept spread across a join path. This is the write path for those.\n\nReturns 409 when a Term with this name already exists, and 422 when the\nname is blank or a ``table_ids`` entry is not in the catalog. The Term is\nembedded before the response so it is immediately retrievable.",
+        "operationId": "create_term_api_terms_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TermCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DataResponse_Term_"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Term",
         "tags": [
           "terms"
         ]

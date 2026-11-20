@@ -564,10 +564,15 @@ def delete_sql_attribute_node(attr_id: str) -> None:
 
 
 def fetch_sql_attributes_with_sql(attr_ids: list[str]) -> list[dict[str, str]]:
-    """``id, name, description, expression, sql, term_name`` per attribute.
+    """``id, name, description, expression, sql, term_name, certified`` per attribute.
 
     One row per attribute even when several statements or terms match — the
     first of each id wins, ordered so "first" is reproducible.
+
+    ``certified`` rides along because metric grounding uses it to prefer a
+    signed-off definition over an uncertified lookalike (see
+    ``retrieval/text_to_sql/metric_grounding.py``), instead of escalating the
+    pair to the user as an ambiguity.
 
     Returns ``[]`` on failure — this feeds retrieval context, where losing the
     context beats losing the answer.
@@ -581,6 +586,7 @@ def fetch_sql_attributes_with_sql(attr_ids: list[str]) -> list[dict[str, str]]:
                 s.sql_attribute.c.name,
                 s.sql_attribute.c.description,
                 s.sql_attribute.c.expression,
+                s.sql_attribute.c.certified,
                 _SQL_TEXT.label("sql_text"),
                 s.term.c.name.label("term_name"),
             )
@@ -612,6 +618,7 @@ def fetch_sql_attributes_with_sql(attr_ids: list[str]) -> list[dict[str, str]]:
                 "expression": row["expression"] or "",
                 "sql": row["sql_text"] or "",
                 "term_name": row["term_name"] or "",
+                "certified": bool(row["certified"]),
             }
         )
     return result
@@ -724,6 +731,7 @@ def fetch_sql_attribute_docs(attr_id: str) -> list[dict[str, Any]]:
             s.sql_attribute.c.name,
             s.sql_attribute.c.description,
             s.sql_attribute.c.source,
+            s.sql_attribute.c.certified,
             s.term.c.name.label("term_name"),
             _SQL_TEXT.label("sql_text"),
         )
@@ -752,9 +760,56 @@ def fetch_sql_attribute_docs(attr_id: str) -> list[dict[str, Any]]:
                 "label": "SqlAttribute",
                 "id": row["id"],
                 "source": row["source"] or "",
+                "certified": bool(row["certified"]),
             }
         )
     return docs
+
+
+def fetch_sql_attribute_databases(attr_ids: list[str]) -> dict[str, str]:
+    """``{attr_id: database_name}`` — the first database each attribute's SQL reaches.
+
+    An attribute whose statement joins across two databases has two answers;
+    this returns the deterministic first one (ordered by database id), matching
+    :func:`auto_ontology.dal.custom_analyses.fetch_database_name_for_analysis`'s
+    ``DISTINCT ... LIMIT 1`` lossiness. Attributes with no resolvable database
+    are simply absent from the result.
+    """
+    if not attr_ids:
+        return {}
+
+    rows = store().query_read(
+        select(
+            s.sql_attribute__sql.c.attribute_id,
+            s.catalog_database.c.name.label("database_name"),
+        )
+        .select_from(
+            s.sql_attribute__sql.join(
+                s.sql_query__table,
+                s.sql_query__table.c.sql_query_id
+                == s.sql_attribute__sql.c.sql_query_id,
+            )
+            .join(
+                s.catalog_table,
+                s.catalog_table.c.id == s.sql_query__table.c.table_id,
+            )
+            .join(
+                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
+            )
+            .join(
+                s.catalog_database,
+                s.catalog_database.c.id == s.catalog_schema.c.database_id,
+            )
+        )
+        .where(s.sql_attribute__sql.c.attribute_id.in_(list(attr_ids)))
+        .distinct()
+        .order_by(s.sql_attribute__sql.c.attribute_id, s.catalog_database.c.id)
+    )
+
+    databases: dict[str, str] = {}
+    for row in rows:
+        databases.setdefault(row["attribute_id"], row["database_name"])
+    return databases
 
 
 #: The module's contract, spelled out.
@@ -774,6 +829,7 @@ __all__ = [
     "delete_sql_attribute_node",
     "detach_existing_sql_edges",
     "fetch_sql_attribute_counts",
+    "fetch_sql_attribute_databases",
     "fetch_sql_attribute_docs",
     "fetch_sql_attributes_by_term_id",
     "fetch_sql_attributes_with_sql",

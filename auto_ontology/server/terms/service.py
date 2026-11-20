@@ -88,6 +88,46 @@ def list_terms_page(
     }
 
 
+def create_term(
+    *,
+    name: str,
+    description: str | None = None,
+    synonyms: list[str] | None = None,
+    table_ids: list[str] | None = None,
+    name_certified: bool = False,
+    description_certified: bool = False,
+    owner_id: str | None = None,
+    created_by: str | None = None,
+) -> dict[str, Any]:
+    """Create a Term, then embed it so retrieval can find it immediately.
+
+    The embedding is what makes the Term real: a row in ``term`` with no vector
+    is invisible to every search (see ``semantic/embed.py``), so a create that
+    skipped this would appear to succeed and change nothing. Failure to embed is
+    logged rather than raised — the Term exists, and ``POST
+    /api/semantic-index/reindex`` is the documented way to fix a stale index.
+    """
+    row = terms_dal.create_term(
+        name=name,
+        description=description,
+        synonyms=synonyms,
+        table_ids=table_ids,
+        name_certified=name_certified,
+        description_certified=description_certified,
+        owner_id=owner_id,
+        created_by=created_by,
+    )
+    try:
+        refresh_term_embeddings(row["id"], refresh_dependent_attrs=False)
+    except Exception:
+        logger.warning(
+            "Created Term %r but could not embed it; reindex to make it retrievable",
+            row["name"],
+            exc_info=True,
+        )
+    return row
+
+
 def update_column_attribute(
     term_id: str,
     attr_id: str,
@@ -105,9 +145,10 @@ def update_column_attribute(
     that Column (same path as catalog column edit), re-embeds the Column in
     the data VDB, then re-embeds this ColumnAttribute in the semantic VDB.
 
-    Neither the certification flag nor the description is embedding content —
-    the attribute embeds its column's description — so an update touching only
-    those skips the VDB refresh entirely.
+    The attribute embeds its column's description, so a description-only edit
+    does not change the embedding text. Certification, however, rides in the
+    VDB metadata (retrieval ranking), so a certification-only edit still
+    re-embeds the row.
 
     Raises ``ValueError`` when the owning Column's declared SQL type does not
     accept hand-written samples.
@@ -135,7 +176,7 @@ def update_column_attribute(
     if row is None:
         return None
 
-    if name is None and sample_values is None:
+    if name is None and sample_values is None and certified is None:
         row["sample_values"] = stringify_sample_values(row.get("sample_values"))
         return row
 
@@ -172,6 +213,7 @@ def update_column_attribute(
             "table_id": row.get("table_id"),
             "table_name": row.get("table_name"),
             "schema_name": row.get("schema_name"),
+            "certified": bool(row.get("certified")),
         }
         # Pass Term synonyms only — omit Term name so we re-embed just this attr row.
         term_ctx = {"synonyms": row.get("term_synonyms") or []}

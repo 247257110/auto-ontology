@@ -566,6 +566,7 @@ def embed_docs_into_vdb(
             "source_path": path,
             "database_name": database_name,
             "source": item.get("source", ""),
+            "certified": bool(item.get("certified", False)),
         }
         rows.append(
             {

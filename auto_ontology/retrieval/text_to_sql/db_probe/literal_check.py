@@ -44,6 +44,7 @@ from __future__ import annotations
 import difflib
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Optional
 
 import sqlglot
@@ -749,6 +750,9 @@ def find_literal_mismatches(
     dialect: Optional[str],
     sql: str,
     result_was_empty: bool = False,
+    distinct_cache: Optional[
+        dict[tuple[str, str], tuple[Optional[list[str]], bool]]
+    ] = None,
 ) -> list[dict[str, Any]]:
     """Return fixable literal mismatches against real database values.
 
@@ -798,7 +802,7 @@ def find_literal_mismatches(
         return []
 
     mismatches: list[dict[str, Any]] = []
-    distinct_cache: dict[tuple[str, str], tuple[Optional[list[str]], bool]] = {}
+    distinct_cache = distinct_cache if distinct_cache is not None else {}
 
     for col, values in _string_predicates(tree):
         actual, table_node, high_card = _resolve_distinct(
@@ -948,6 +952,188 @@ def _render_integer_division_mismatch(m: dict[str, Any]) -> str:
         f"silently truncates toward zero (e.g. 5/2 = 2, not 2.5) — any "
         f"ratio or average computed this way is wrong."
     )
+
+
+@dataclass(frozen=True)
+class LiteralVerdict:
+    """What a live probe established about one filter literal.
+
+    ``status`` is one of:
+
+    * ``present`` — the literal matches a real value exactly.
+    * ``near_miss`` — no exact match, but a real value is close enough to be a
+      typo. This is the repair signal ``find_literal_mismatches`` acts on.
+    * ``absent_enum`` — no match and no near miss, on a **low-cardinality**
+      column: the data holds a small, closed set of values and this is not one
+      of them. The emptiness is a fact about the data.
+    * ``absent_open`` — no match and no near miss, on a **high-cardinality**
+      column. Absence there usually means the value lives somewhere else (a
+      different column or table), so it proves nothing about the question.
+    * ``unresolved`` — the column could not be probed, so there is no verdict.
+    """
+
+    table: Optional[str]
+    column: str
+    used: str
+    status: str
+    #: Real values of the column, when the column was small enough to list.
+    candidates: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "table": self.table,
+            "column": self.column,
+            "used": self.used,
+            "status": self.status,
+            "candidates": list(self.candidates),
+        }
+
+
+@dataclass(frozen=True)
+class EmptyVerdict:
+    """Why a query returned no rows, as far as a live probe can tell.
+
+    The distinction this draws is the one that decides whether an empty result
+    is worth another regeneration: *the data has no such value* (answer it) or
+    *the query asked the wrong question of it* (retry). PQL's label code hit the
+    same confusion when a zero-count window was read as "no value" rather than
+    "zero" — see ``retrieval/kumo/hosted.py``'s ``_ZERO_ON_EMPTY`` note.
+    """
+
+    literals: tuple[LiteralVerdict, ...] = ()
+
+    @property
+    def is_data_fact(self) -> bool:
+        """Whether the emptiness is fully explained by a value the data lacks.
+
+        Deliberately strict — every one of these has to hold:
+
+        * at least one literal was checked (nothing checked proves nothing);
+        * none is a near miss (that is a typo, repaired elsewhere);
+        * none is ``absent_open`` or ``unresolved`` (both leave the emptiness
+          unexplained, which is what the undiagnosed retry exists for);
+        * at least one is ``absent_enum`` (otherwise nothing explains zero rows
+          — e.g. every value is present and a join dropped everything).
+        """
+        if not self.literals:
+            return False
+        statuses = [item.status for item in self.literals]
+        if any(
+            status in {"near_miss", "absent_open", "unresolved"} for status in statuses
+        ):
+            return False
+        return "absent_enum" in statuses
+
+    def absent_values(self) -> tuple[LiteralVerdict, ...]:
+        return tuple(item for item in self.literals if item.status == "absent_enum")
+
+    def explain(self) -> str:
+        """One sentence the answer can carry, in the question's language."""
+        absent = self.absent_values()
+        if not absent:
+            return ""
+        parts: list[str] = []
+        for item in absent:
+            where = f"{item.table}.{item.column}" if item.table else item.column
+            part = f"`{where}` 中没有取值 `{item.used}`"
+            if item.candidates:
+                listed = "、".join(f"`{value}`" for value in item.candidates[:8])
+                part += f"（该列的实际取值为 {listed}）"
+            parts.append(part)
+        return (
+            "查询已成功执行，结果为空是数据事实而非 SQL 错误："
+            + "；".join(parts)
+            + "。若你预期有数据，说明这个取值被记在了别的列或别的表里。"
+        )
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "verdict": "data_fact" if self.is_data_fact else "undiagnosed",
+            "literals": [item.as_dict() for item in self.literals],
+            "explanation": self.explain() if self.is_data_fact else "",
+        }
+
+
+def classify_empty_result(
+    executor: ProbeExecutor,
+    dialect: Optional[str],
+    sql: str,
+    distinct_cache: Optional[
+        dict[tuple[str, str], tuple[Optional[list[str]], bool]]
+    ] = None,
+) -> EmptyVerdict:
+    """Classify why *sql* returned no rows, judging only its filter literals.
+
+    Shares the DISTINCT probes with :func:`find_literal_mismatches` through
+    *distinct_cache*, so calling both costs one probe per filtered column, not
+    two. Pass the same dict to both.
+
+    Says nothing when the query has no string filter at all: with no literal to
+    check, an empty result is equally explainable by a join that dropped the
+    rows, and claiming otherwise would suppress exactly the retry that fixes it.
+    """
+    try:
+        tree = sqlglot.parse_one(sql, read=dialect or None)
+    except Exception as exc:  # noqa: BLE001 — never break the pipeline on a parse error
+        logger.info("classify_empty_result: could not parse SQL (%s)", exc)
+        return EmptyVerdict()
+    if tree is None:
+        return EmptyVerdict()
+
+    all_nodes, by_key = _table_nodes(tree)
+    if not all_nodes:
+        return EmptyVerdict()
+
+    cache = distinct_cache if distinct_cache is not None else {}
+    verdicts: list[LiteralVerdict] = []
+    for col, values in _string_predicates(tree):
+        actual, table_node, high_card = _resolve_distinct(
+            executor, dialect, col, all_nodes, by_key, cache
+        )
+        owning_table = table_node.name if table_node is not None else None
+
+        for used in values:
+            if actual is None:
+                # High-cardinality is a definite "not decidable here"; a failed
+                # probe or a column no candidate table owns is `unresolved`.
+                status = "absent_open" if high_card else "unresolved"
+                verdicts.append(
+                    LiteralVerdict(
+                        table=owning_table, column=col.name, used=used, status=status
+                    )
+                )
+                continue
+
+            if used in actual:
+                status = "present"
+            elif any(_norm(used) == _norm(v) for v in actual):
+                status = "near_miss"
+            elif difflib.get_close_matches(
+                used, actual, n=1, cutoff=_CLOSE_MATCH_CUTOFF
+            ):
+                status = "near_miss"
+            else:
+                # The column's whole value set is known (it was small enough to
+                # list) and this is not in it — that is a fact about the data.
+                status = "absent_enum"
+            verdicts.append(
+                LiteralVerdict(
+                    table=owning_table,
+                    column=col.name,
+                    used=used,
+                    status=status,
+                    candidates=tuple(actual) if status == "absent_enum" else (),
+                )
+            )
+
+    verdict = EmptyVerdict(literals=tuple(verdicts))
+    if verdict.literals:
+        logger.info(
+            "classify_empty_result: %s (%s)",
+            "data_fact" if verdict.is_data_fact else "undiagnosed",
+            [f"{item.column}='{item.used}':{item.status}" for item in verdict.literals],
+        )
+    return verdict
 
 
 def build_value_repair_error(mismatches: list[dict[str, Any]]) -> str:

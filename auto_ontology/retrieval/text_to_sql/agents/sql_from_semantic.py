@@ -49,6 +49,11 @@ from auto_ontology.retrieval.text_to_sql.state import (
 from auto_ontology.retrieval.text_to_sql.metric_grounding import (
     build_metric_clarification_question,
 )
+from auto_ontology.retrieval.text_to_sql.db_probe.date_window import probe_data_window
+from auto_ontology.retrieval.text_to_sql.time_anchor import (
+    format_time_anchor_section as _render_time_anchor,
+    resolve_time_ranges,
+)
 from auto_ontology.retrieval.text_to_sql.prompts import (
     create_sql_from_candidates_prompt,
     create_sql_user_prompt,
@@ -117,11 +122,18 @@ def format_metric_semantics_section(path_state: dict[str, Any]) -> str:
         lines.append("Grounding against retrieved ontology objects:")
         for metric in grounded_metrics:
             selected = metric.get("selected") or {}
-            line = f"- {metric.get('name', '')}: status={metric.get('status', 'unresolved')}"
+            label = "维度" if metric.get("role") == "dimension" else "指标"
+            line = (
+                f"- {label}「{metric.get('name', '')}」: "
+                f"status={metric.get('status', 'unresolved')}"
+            )
+            if metric.get("qualifiers"):
+                line += f", qualifiers={','.join(metric['qualifiers'])}"
             if selected:
                 line += (
                     f", selected={selected.get('kind')}:{selected.get('name')}"
-                    f" (score={selected.get('score')})"
+                    f" (score={selected.get('score')}"
+                    f"{'，certified' if selected.get('certified') else ''})"
                 )
                 definition = (
                     selected.get("expression")
@@ -131,6 +143,13 @@ def format_metric_semantics_section(path_state: dict[str, Any]) -> str:
                 if definition:
                     line += f"\n  Definition: {definition}"
             lines.append(line)
+    for section in (
+        format_metric_bindings_section(grounded_metrics),
+        format_dimension_bindings_section(grounded_metrics),
+    ):
+        if section:
+            lines.append("")
+            lines.append(section.rstrip("\n"))
     if ir.get("ambiguities"):
         lines.append("Ambiguities to resolve from ontology evidence:")
         lines.extend(f"- {item}" for item in ir["ambiguities"])
@@ -142,6 +161,126 @@ def format_metric_semantics_section(path_state: dict[str, Any]) -> str:
             for item in time_ranges
         )
     return "\n".join(lines) + "\n"
+
+
+def format_dimension_bindings_section(
+    grounded_metrics: list[dict[str, Any]] | None,
+) -> str:
+    """Render the certified *dimension* definitions that must be joined through.
+
+    A dimension concept is a join path plus a grouping key, not a formula:
+    "地域" is `customers.deliverycityid → cities → stateprovinces`, and getting
+    it wrong is invisible — the query runs, groups by city, and answers a
+    different question. So this section pins the path and the key while leaving
+    the metric, filters and date range to the question, which is the opposite of
+    what a metric binding does.
+    """
+    required = [
+        metric
+        for metric in grounded_metrics or []
+        if metric.get("binding") == "required" and metric.get("role") == "dimension"
+    ]
+    if not required:
+        return ""
+
+    lines = [
+        "## Certified dimension definitions — use this join path and key",
+        "Each dimension below has one certified definition. Join and group the way "
+        "it does. The metric, the filters and the date range still come from the "
+        "question — only the path and the grouping key are fixed.",
+    ]
+    for metric in required:
+        selected = metric.get("selected") or {}
+        definition = selected.get("expression") or selected.get("sql") or ""
+        lines.append(
+            f"- Dimension `{metric.get('name', '')}` "
+            f"(certified definition `{selected.get('name', '')}`):"
+        )
+        if definition:
+            lines.append(f"  ```sql\n  {definition.strip()}\n  ```")
+        if selected.get("description"):
+            lines.append(f"  Documented meaning: {selected['description']}")
+    return "\n".join(lines) + "\n"
+
+
+def format_metric_bindings_section(
+    grounded_metrics: list[dict[str, Any]] | None,
+) -> str:
+    """Render the certified definitions that must be reused verbatim.
+
+    A ``binding == "required"`` metric is one the ontology settles: exactly one
+    certified SQL Attribute matched, it is clearly ahead of every alternative,
+    and the question's own qualifier (if any) agrees with it. Emitting it as
+    "must use this expression" is what turns *guidance* into a constraint, and
+    is the difference between "毛利率" landing on the signed-off
+    ``SUM(lineprofit) / NULLIF(SUM(extendedprice - taxamount), 0)`` and the
+    model re-deriving a different denominator.
+    """
+    required = [
+        metric
+        for metric in grounded_metrics or []
+        if metric.get("binding") == "required" and metric.get("role") != "dimension"
+    ]
+    if not required:
+        return ""
+
+    lines = [
+        "## Certified metric definitions — reuse these verbatim",
+        "Each metric below has exactly one certified definition in the ontology. "
+        "Use its expression as written: keep the same columns, joins, filters and "
+        "NULLIF guards. Do not substitute an alternative formula, do not "
+        "re-derive the metric from raw columns, and do not widen or narrow its "
+        "scope.",
+    ]
+    for metric in required:
+        selected = metric.get("selected") or {}
+        name = metric.get("name", "")
+        definition = selected.get("expression") or selected.get("sql") or ""
+        lines.append(
+            f"- Metric `{name}` (certified SQL Attribute `{selected.get('name', '')}`):"
+        )
+        if definition:
+            lines.append(f"  ```sql\n  {definition.strip()}\n  ```")
+        if selected.get("description"):
+            lines.append(f"  Documented meaning: {selected['description']}")
+    return "\n".join(lines) + "\n"
+
+
+def build_time_anchor_section(
+    path_state: dict[str, Any],
+    relevant_tables: list[dict],
+    connector: Any,
+) -> str:
+    """Anchor the question's relative time phrases on the data's own calendar.
+
+    Only runs when the question actually contains a relative phrase *and* the
+    IR produced a canonical form for it — a MIN/MAX probe per date column is
+    cheap, but not free on every question that never mentions a date.
+
+    The window is probed from the live connection rather than read from the
+    catalog: the catalog stores no column statistics, and the failure this
+    prevents ("最近12个月" compiled against a snapshot that stopped years ago,
+    returning zero rows) is worth one indexed aggregate.
+    """
+    time_ranges = (path_state.get("semantic_ir") or {}).get("time_ranges") or []
+    if not time_ranges or connector is None:
+        return ""
+
+    window = probe_data_window(connector, relevant_tables)
+    if window is None or not window.usable:
+        return ""
+
+    resolved = resolve_time_ranges(time_ranges, window)
+    if not resolved:
+        # The window was measurable but none of the phrases had a canonical form
+        # this module understands; saying anything would be a guess.
+        return ""
+
+    path_state["time_anchor"] = {
+        "window": window.as_dict(),
+        "resolved": [item.as_dict() for item in resolved],
+    }
+    return _render_time_anchor(resolved, window)
 
 
 class SQLFromCandidatesAgent(BaseAgent):
@@ -214,7 +353,6 @@ class SQLFromCandidatesAgent(BaseAgent):
         main_question = format_dual_question_block(
             original_question, sanitized_question
         )
-
         primary_attribute: dict | None = path_state.get("primary_attribute")
         attribute_join_paths: list[dict] = path_state.get("attribute_join_paths") or []
         relevant_tables = path_state.get("relevant_tables", [])
@@ -240,8 +378,34 @@ class SQLFromCandidatesAgent(BaseAgent):
                 },
             }
 
+        bound_metrics = [
+            metric
+            for metric in (path_state.get("grounded_metrics") or [])
+            if metric.get("binding") == "required"
+        ]
+        if bound_metrics:
+            self.logger.info(
+                "Pinning %d certified definition(s) into the SQL prompt: %s",
+                len(bound_metrics),
+                [
+                    f"{metric.get('role')}:{metric.get('name')}"
+                    for metric in bound_metrics
+                ],
+            )
+
         connector = resolve_connector_from_tables(relevant_tables, connectors)
         dialect = getattr(connector, "dialect", None)
+
+        # Probed after the connector resolves: resolving the window needs a live
+        # connection, and only questions with a relative time phrase get here.
+        time_anchor_section = build_time_anchor_section(
+            path_state, relevant_tables, connector
+        )
+        if time_anchor_section:
+            self.logger.info(
+                "Anchoring relative time phrases on the data window: %s",
+                (path_state.get("time_anchor") or {}).get("window"),
+            )
 
         self.logger.info(
             "Semantic context: anchor=%s, join_paths=%d, custom_analyses=%d, "
@@ -277,6 +441,16 @@ class SQLFromCandidatesAgent(BaseAgent):
             )
         if metric_semantics_section:
             self.logger.info("Injecting metric semantic intent into SQL prompt.")
+        if time_anchor_section:
+            self.logger.info(
+                "Injecting resolved time ranges into SQL prompt: %s",
+                [
+                    item.get("canonical")
+                    for item in (path_state.get("time_anchor") or {}).get(
+                        "resolved", []
+                    )
+                ],
+            )
 
         def build_messages() -> list:
             """
@@ -311,6 +485,8 @@ class SQLFromCandidatesAgent(BaseAgent):
                 observation_block += f"\n{authoritative_evidence_section}\n"
             if metric_semantics_section:
                 observation_block += f"\n{metric_semantics_section}\n"
+            if time_anchor_section:
+                observation_block += f"\n{time_anchor_section}\n"
             # Build custom analyses section for user prompt
             ca_section = format_custom_analyses_section(custom_analyses)
 

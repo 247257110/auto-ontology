@@ -18,6 +18,7 @@ from auto_ontology.semantic.chinese import (
     format_aliases,
     normalize_chinese_text,
 )
+from auto_ontology.semantic.relation_kind import classify_name
 from auto_ontology.vdb import get_semantic_vdb
 from auto_ontology.vdb.postgres import PostgresVDB
 from auto_ontology.vdb.records import write_embedded_rows
@@ -167,6 +168,7 @@ def embed_all_semantic_nodes(
                     "synonyms": term.get("synonyms") or [],
                     "id": term.get("id"),
                     "schema_names": term.get("schema_names") or [],
+                    "certified": _term_certified(term),
                 },
                 attrs_by_term.get(term_name, []),
             )
@@ -217,6 +219,20 @@ def _format_sample_values(raw: Any, data_type: str | None = None) -> str:
     return " Sample values: " + ", ".join(values) + "."
 
 
+def _term_certified(term: dict[str, Any]) -> bool:
+    """A Term's vetted status, tolerant of the many fetch shapes.
+
+    Embedding callers select different subsets of the Term row. An explicit
+    ``certified`` boolean wins when present; otherwise fall back to the two
+    persisted flags (``name_certified`` and ``description_certified``), both
+    of which must be true. Missing everything means uncertified — safe for
+    callers that never selected those columns.
+    """
+    if term.get("certified") is not None:
+        return bool(term.get("certified"))
+    return bool(term.get("name_certified")) and bool(term.get("description_certified"))
+
+
 def _build_rows(
     database_name: str,
     term: dict[str, Any],
@@ -245,6 +261,16 @@ def _build_rows(
             fields["schema_names"] = schema_names
         if term.get("synonyms"):
             fields["synonyms"] = format_aliases(term.get("synonyms"))
+        if _term_certified(term):
+            fields["certified"] = True
+        # Set at compile time from the catalog's own ``table_type`` plus the
+        # archive naming convention (see ``semantic/relation_kind``). Retrieved
+        # rows rank a reference relation below a base table with it.
+        relation_kind = term.get("relation_kind") or classify_name(
+            term_name, term.get("table_type")
+        )
+        if relation_kind:
+            fields["relation_kind"] = relation_kind
         rows.append(
             {
                 "text": text,
@@ -316,6 +342,16 @@ def _build_rows(
             fields["data_type"] = a["datatype"]
         if a.get("id"):
             fields["id"] = a["id"]
+        if a.get("certified"):
+            fields["certified"] = True
+        # Same label as the Term row, derived from the attribute's own table —
+        # an attribute of an archive table is an archive column even when the
+        # Term behind it is a live one.
+        relation_kind = a.get("relation_kind") or classify_name(
+            a.get("table_name"), a.get("table_type")
+        )
+        if relation_kind:
+            fields["relation_kind"] = relation_kind
         rows.append(
             {
                 "text": text,

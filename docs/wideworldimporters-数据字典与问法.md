@@ -1238,12 +1238,24 @@ models = self._probe('/v1/models')         # 必须列出 id == 'kumo-relational
 ```
 
 语义层把某个自由文本列标成了 `categorical`（1.5 万个取值）。`_column_spec` 现在会数一遍
-基数，超过 10,000 就不再按 categorical 送：
+基数，超过 10,000 就不再按 categorical 送。后来实测又确认：托管端点的 SDM **根本不读
+`text` 这个语义类型**，声明它会让整条请求直接失败：
 
-| 列的实际类型 | 降级为 | 为什么 |
+```
+422 {"type":"/problems/validation-failed","detail":"column 'company_name' declares semantic type 'text', which SDM does not read","code":"UNSUPPORTED_DTYPE"}
+```
+
+所以 `text` 在托管路径上不能作为降级目标，只能按“端点读得懂的类型”或“不下发”二选一：
+
+| 列的实际类型 | 处理 | 为什么 |
 |---|---|---|
-| 字符串 / 自由文本 | `text` | 它本来就是文本，声明成 text 是诚实的 |
-| 数值（`int64`/`float64`） | `numerical` | 送 `text` 会让 dtype 与 stype 互相矛盾（int64 + text），端点只能自己再解释一遍，同一个 422 会再来 |
+| 字符串 / 自由文本（声明为 `text`，或 categorical 基数超限） | 基数 ≤ 10,000 时按 `categorical` 下发；超过则整列不下发（schema 与 context/predict 行同时摘掉） | 端点不读 `text`，categorical 又封顶 10,000；自由文本列本来也当不了类别，留空比整条请求失败好 |
+| 数值（`int64`/`float64`） | `numerical` | 送 `text` 会因 `UNSUPPORTED_DTYPE` 被拒；声明成 numerical 才和 dtype 一致，同一个 422 不会再来 |
+
+还有一个容易漏的类型：Postgres 的 `numeric` 经驱动回来是 `Decimal`，pandas 里 dtype 是 `object`，
+如果按字符串处理，金额/单价这类度量会被当成宽文本整列丢掉。`_dtype_of` 现在识别"整列都是
+`Decimal`"的 object 列并按 `float64`/`numerical` 下发，`_scalar` 同时把值转成 JSON 数字，
+保证声明和行一致。
 
 **⑤ 训练行上限 10,000（N_train）**
 
@@ -1268,7 +1280,7 @@ context 表是每个 `(实体, 锚点)` 一行，8 个锚点 × 1620 个实体 =
 
 上面四个上限里，凡是"请求太宽"这一类（而不是"问错了"），`predict` 不再直接把 422 抛给用户：
 `_predict_response` 会按端点回显的 `exceeds limit N` 重算一遍列基数（按**实际发出的行**数，不是仓库表），
-把最宽的那几列从 schema 和行里一起摘掉再发一次（最多两轮：先摘 categorical/text，再摘相关表自己的
+把最宽的那几列从 schema 和行里一起摘掉再发一次（最多两轮：先摘 categorical，再摘相关表自己的
 ID 键）。关系连接用的列永不摘除 —— 摘了会把一个 422 换成另一个。
 
 日志会点名列宽和摘掉的列，因为端点只回基数、不回列名：

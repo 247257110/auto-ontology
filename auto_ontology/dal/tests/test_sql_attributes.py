@@ -587,6 +587,8 @@ def test_with_sql_returns_one_row_per_attribute(world) -> None:
             "expression": "sum(amount)",
             "sql": "SELECT 1",
             "term_name": f"{world.prefix}-Revenue",
+            # Metric grounding uses this to prefer a signed-off definition.
+            "certified": False,
         }
     ]
 
@@ -641,6 +643,7 @@ def test_doc_text_format_is_reproduced_exactly(world) -> None:
             # the VDB metadata, where a None would have to be special-cased by
             # every reader.
             "source": "",
+            "certified": False,
         }
     ]
 

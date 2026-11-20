@@ -295,12 +295,12 @@ class _RepairingModel:
         return pd.DataFrame({"ENTITY": keys, "True_PROB": [0.5] * len(keys)})
 
 
-def test_a_failed_attempt_does_not_leave_its_anchor_note_behind() -> None:
+def test_a_failed_attempt_does_not_leave_its_staleness_note_behind() -> None:
     """One note per run: the caller reads these as one statement about one forecast.
 
-    Each attempt derives its own anchor from its own PQL, so joining them without
-    a reset leaves the answer asserting two different anchor dates — neither of
-    which the failed attempt ever produced a prediction for.
+    Each attempt derives its own data edge, so joining them without a reset
+    leaves the same staleness warning repeated once per attempt — a paragraph
+    about the data rather than one sentence about the forecast.
     """
     llm = _ScriptedLLM(
         "PREDICT COUNT(orders.*, 0, 90, days) = 0 FOR EACH customers.customer_id",
@@ -321,8 +321,6 @@ def test_a_failed_attempt_does_not_leave_its_anchor_note_behind() -> None:
 
     assert result.success is True
     assert result.note is not None
-    assert result.note.count("锚定在") == 1
-    # 2025-06-30 − (30 + 7) days: the window that actually ran.
-    assert "2025-05-24" in result.note
-    # 2025-06-30 − (90 + 7): the abandoned attempt's anchor.
-    assert "2025-03-25" not in result.note
+    assert result.note.count("数据截止到") == 1
+    assert result.note.count("2025-06-30") == 1
+    assert "锚定在" not in result.note

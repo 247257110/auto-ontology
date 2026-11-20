@@ -57,6 +57,11 @@ type TermUpdatePayload = {
 	description?: string | null;
 	name_certified?: boolean;
 	description_certified?: boolean;
+	/**
+	 * Alternate names a question may use for this term. Embedded with the rest of
+	 * the term's text, so changing them re-embeds the term and its attributes.
+	 */
+	synonyms?: string[];
 	/** A user id or a group id. Null clears the owner. */
 	owner_id?: string | null;
 };

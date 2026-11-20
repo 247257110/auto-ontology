@@ -17,7 +17,7 @@ from auto_ontology.dal.model_interchange import (
 )
 from auto_ontology.server.model_interchange import service
 from auto_ontology.server.model_interchange.schemas import ExportRequest
-from auto_ontology.server.responses import ModelImportResponse
+from auto_ontology.server.responses import ModelConsistencyResponse, ModelImportResponse
 
 router = APIRouter()
 
@@ -71,6 +71,43 @@ def export_model(body: ExportRequest) -> Response:
         media_type=media_type,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.post("/model/consistency", response_model=ModelConsistencyResponse)
+def check_model_consistency(body: ExportRequest) -> dict:
+    """Report what reading the exported Ossie document cannot reveal.
+
+    Dangling relationship fields, duplicate metric names, the tables a term was
+    narrowed away from, and the object types Ossie has no place for. Empty
+    findings on a consistent export — that is what makes it usable as a gate as
+    well as a panel.
+
+    Same work as an export (it builds one), so it is on demand rather than on
+    the query path.
+    """
+    try:
+        return service.check_model(body)
+    except UnknownDatabaseIdsError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except AutoOntologyConversionError as exc:
+        # A model Ossie cannot hold at all is itself the most important finding,
+        # and an export would 422 here too. Report it rather than failing the
+        # page: the panel exists to explain exactly this.
+        return {
+            "ok": False,
+            "counts": {"error": 1, "warning": 0, "info": 0},
+            "shape": {"datasets": 0, "relationships": 0, "metrics": 0},
+            "findings": [
+                {
+                    "severity": "error",
+                    "code": "not_exportable",
+                    "subject": "document",
+                    "message": (f"这份模型无法导出为 Apache Ossie：{exc}"),
+                    "line": None,
+                    "detail": {},
+                }
+            ],
+        }
 
 
 @router.post("/model/import", response_model=ModelImportResponse)
