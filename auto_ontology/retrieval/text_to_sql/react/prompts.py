@@ -452,13 +452,18 @@ SUBMIT_TOOL = {
                 "response": {
                     "type": "string",
                     "description": (
-                        "Two to four plain-English sentences for the user: what is "
-                        "calculated, from which data, with which filters."
+                        "Two to four concise sentences for the user: what is "
+                        "calculated, from which data, with which filters. Use the "
+                        "language the question was asked in; keep table and column "
+                        "names and data values exactly as they are."
                     ),
                 },
                 "assumptions": {
                     "type": "string",
-                    "description": "Any choice the question left open, and why.",
+                    "description": (
+                        "Any choice the question left open, and why. Use the "
+                        "language the question was asked in."
+                    ),
                 },
             },
             "required": ["sql", "response"],

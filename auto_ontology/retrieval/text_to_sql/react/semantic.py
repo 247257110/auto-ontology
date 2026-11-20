@@ -206,6 +206,24 @@ def _with_sql_details(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
+def answer_language_note(question: str) -> str:
+    """Tell the model to answer in the language the user asked in.
+
+    The ReAct prompts are English, and the submit tool asks for a prose answer;
+    without this the model writes English prose under a Chinese question. Table
+    names, identifiers and data values stay as they are — only the explanation
+    is translated.
+    """
+    if not contains_cjk(question):
+        return ""
+    return (
+        "## Answer language\n"
+        "The user asked in Simplified Chinese. Write `response` and "
+        "`assumptions` in Simplified Chinese. Keep table names, column names, "
+        "SQL, and values quoted from the data exactly as they are."
+    )
+
+
 def build_time_anchor(
     context: SemanticContext | None,
     connector: Any,
@@ -390,6 +408,7 @@ def format_metric_bindings_section(
 
 __all__ = [
     "SemanticContext",
+    "answer_language_note",
     "build_semantic_context",
     "build_time_anchor",
     "format_dimension_bindings_section",

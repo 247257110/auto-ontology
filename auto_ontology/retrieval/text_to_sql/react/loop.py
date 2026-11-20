@@ -49,6 +49,7 @@ from auto_ontology.retrieval.text_to_sql.react.run_sql import (
 )
 from auto_ontology.retrieval.text_to_sql.react.semantic import (
     SemanticContext,
+    answer_language_note,
     format_semantic_context,
 )
 
@@ -246,6 +247,9 @@ def run_episode(
     )
     if custom_prompts:
         system_prompt = f"{system_prompt}\n\n{custom_prompts}"
+    language_note = answer_language_note(question)
+    if language_note:
+        system_prompt = f"{system_prompt}\n\n{language_note}"
     # Dialect rules, e.g. for MySQL: do not CAST or ROUND computed values,
     # which changes the digits an exact grader compares.
     dialect_rules = format_dialect_rules(dialect).strip() if writes_sql else ""

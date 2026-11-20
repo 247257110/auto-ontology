@@ -154,3 +154,10 @@ def test_the_time_anchor_is_computed_once(monkeypatch) -> None:
 
     assert _time_anchor(ctx) == "## Time anchoring"
     assert _time_anchor(ctx) == ""
+
+
+def test_a_chinese_question_asks_for_a_chinese_answer() -> None:
+    note = semantic.answer_language_note("查询最近30天营收")
+    assert "Simplified Chinese" in note
+    assert "table names" in note
+    assert semantic.answer_language_note("revenue by region") == ""

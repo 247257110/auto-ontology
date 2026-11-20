@@ -191,3 +191,24 @@ def test_a_semantic_context_reaches_the_episode(
 
     assert calls[0]["semantic_context"] is context
     assert result["path_state"]["semantic_ir"] == context.ir
+
+
+def test_a_chinese_question_gets_a_chinese_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        agent_module, "build_semantic_context", lambda *a, **k: SemanticContext()
+    )
+    monkeypatch.setattr(
+        agent_module, "run_episode", lambda *a, **k: _episode(None, "budget_exhausted")
+    )
+
+    result = agent_module.ReactSQLAgent().execute(
+        {
+            **_state(),
+            "initial_question": "查询最近30天营收",
+            "prediction_override": False,
+        }
+    )
+
+    assert "无法" in result["path_state"]["unconstructable_explanation"]

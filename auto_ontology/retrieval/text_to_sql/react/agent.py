@@ -33,6 +33,7 @@ from auto_ontology.retrieval.text_to_sql.state import (
     get_question_for_processing,
     get_standalone_question,
 )
+from auto_ontology.semantic.chinese import contains_cjk
 
 STEP_NAME = "react_sql_agent"
 
@@ -40,8 +41,15 @@ _UNANSWERED = (
     "I couldn't write a query that answers this question from the data I could "
     "find. Try rephrasing it, or name the table or measure you mean."
 )
+_UNANSWERED_ZH = (
+    "我无法根据找到的数据写出能回答这个问题的查询。请换一种问法，或指明要用的表或指标。"
+)
 
 _NO_ASSUMPTIONS = "No assumptions were needed beyond what the question states."
+_NO_ASSUMPTIONS_ZH = "除问题本身之外，未做额外假设。"
+
+_RESULT = "Here is the result of the query."
+_RESULT_ZH = "这是查询结果。"
 
 
 def _tool_thought(call: dict[str, Any]) -> str:
@@ -73,6 +81,8 @@ class ReactSQLAgent(BaseAgent):
 
     def execute(self, state: AgentState) -> Dict[str, Any]:
         path_state = dict(state.get("path_state") or {})
+        processing_question = get_question_for_processing(state)
+        chinese = contains_cjk(processing_question)
         ctx = ToolContext(
             retriever=state.get("semantic_retriever") or state.get("data_retriever"),
             data_retriever=state.get("data_retriever"),
@@ -154,8 +164,8 @@ class ReactSQLAgent(BaseAgent):
         submission = result.submission
         if submission is None:
             self.logger.info("ReAct episode ended without an answer: %s", result.reason)
-            path_state["unconstructable_explanation"] = (
-                ctx.prediction_refusal or _UNANSWERED
+            path_state["unconstructable_explanation"] = ctx.prediction_refusal or (
+                _UNANSWERED_ZH if chinese else _UNANSWERED
             )
             return {"decision": "unconstructable", "path_state": path_state}
 
@@ -177,9 +187,10 @@ class ReactSQLAgent(BaseAgent):
 
         path_state["sql_code"] = submission.sql
         path_state["sql_generation_result"] = SQLGenerationModel(
-            thought=submission.assumptions or _NO_ASSUMPTIONS,
+            thought=submission.assumptions
+            or (_NO_ASSUMPTIONS_ZH if chinese else _NO_ASSUMPTIONS),
             sql_code=submission.sql,
-            response=submission.response or "Here is the result of the query.",
+            response=submission.response or (_RESULT_ZH if chinese else _RESULT),
         )
         path_state["sql_response_from_db"] = submission.db_response.result
         path_state.setdefault("candidates", [])
