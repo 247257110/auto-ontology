@@ -19,8 +19,15 @@ from auto_ontology.retrieval.text_to_sql.base import BaseAgent, record_thought
 from auto_ontology.retrieval.text_to_sql.models import SQLGenerationModel
 from auto_ontology.retrieval.text_to_sql.react.context import ToolContext
 from auto_ontology.retrieval.text_to_sql.react.loop import run_episode
-from auto_ontology.retrieval.text_to_sql.react.mode import ToolName, episode_mode
+from auto_ontology.retrieval.text_to_sql.react.mode import (
+    EpisodeMode,
+    ToolName,
+    episode_mode,
+)
 from auto_ontology.retrieval.text_to_sql.react.run_sql import connector_for
+from auto_ontology.retrieval.text_to_sql.react.semantic import (
+    build_semantic_context,
+)
 from auto_ontology.retrieval.text_to_sql.state import (
     AgentState,
     get_question_for_processing,
@@ -85,17 +92,43 @@ class ReactSQLAgent(BaseAgent):
         can_run_queries = getattr(connector, "can_run_queries", None)
         if callable(can_run_queries):
             ctx.can_run_queries = can_run_queries
+
+        mode = episode_mode(state.get("prediction_override"))
+        semantic = None
+        semantic_retriever = state.get("semantic_retriever")
+        if mode is not EpisodeMode.PREDICT and semantic_retriever is not None:
+            semantic = build_semantic_context(
+                get_question_for_processing(state),
+                semantic_retriever,
+                database_name=ctx.database_name,
+            )
+            path_state["semantic_ir"] = semantic.ir
+            path_state["grounded_metrics"] = semantic.grounded_metrics
+            if semantic.clarification:
+                path_state["metric_clarification_question"] = semantic.clarification
+                if mode is EpisodeMode.SQL:
+                    self.logger.info(
+                        "Metric grounding requires clarification before SQL: %s",
+                        semantic.clarification,
+                    )
+                    path_state["unconstructable_explanation"] = semantic.clarification
+                    return {
+                        "decision": "unconstructable",
+                        "path_state": path_state,
+                    }
+
         result = run_episode(
             state.get("reasoning_llm") or state["llm"],
             ctx,
             question=get_question_for_processing(state),
             evidence=state.get("evidence"),
             dialect=getattr(connector, "dialect", None),
-            mode=episode_mode(state.get("prediction_override")),
+            mode=mode,
             custom_prompts=state.get("custom_prompts"),
             sql_examples=state.get("sql_examples"),
             value_anchors=state.get("value_anchors"),
             shorten_answer=bool(state.get("shorten_answer")),
+            semantic_context=semantic,
         )
 
         for step in result.trajectory:

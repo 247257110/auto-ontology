@@ -47,6 +47,10 @@ from auto_ontology.retrieval.text_to_sql.react.run_sql import (
     connector_for,
     run_sql,
 )
+from auto_ontology.retrieval.text_to_sql.react.semantic import (
+    SemanticContext,
+    format_semantic_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +229,7 @@ def run_episode(
     sql_examples: list[dict[str, str]] | None = None,
     value_anchors: list[dict[str, str]] | None = None,
     shorten_answer: bool = False,
+    semantic_context: SemanticContext | None = None,
 ) -> EpisodeResult:
     """Run the model with *mode*'s tools until it answers or the budget ends.
 
@@ -232,7 +237,8 @@ def run_episode(
     offers both and lets the model choose. *custom_prompts* is the
     organization's sections from :func:`prompts.custom_prompts_section`.
     *sql_examples*, *value_anchors* and *shorten_answer* shape a SQL answer, so
-    a ``predict`` episode ignores them.
+    a ``predict`` episode ignores them. *semantic_context* carries the Chinese
+    metric IR and its ontology grounding into the system prompt.
     """
     writes_sql = mode != EpisodeMode.PREDICT
     system_prompt = prompts.system_prompt_for(
@@ -245,6 +251,9 @@ def run_episode(
     dialect_rules = format_dialect_rules(dialect).strip() if writes_sql else ""
     if dialect_rules:
         system_prompt = f"{system_prompt}\n\n{dialect_rules}"
+    semantic_section = format_semantic_context(semantic_context) if writes_sql else ""
+    if semantic_section:
+        system_prompt = f"{system_prompt}\n\n{semantic_section}"
     if shorten_answer and writes_sql:
         system_prompt = f"{system_prompt}\n\n{prompts.SHORT_ANSWER_RULES}"
     user_message = prompts.user_message(
