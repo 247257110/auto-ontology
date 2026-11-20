@@ -20,8 +20,9 @@ from auto_ontology.retrieval.kumo.column_reference import (
     safe_values,
 )
 from auto_ontology.retrieval.kumo.pql_gen import (
+    _data_edge,
     _forecast_anchor,
-    _stale_anchor_note,
+    _stale_data_note,
     _STALE_ANCHOR_DAYS,
 )
 
@@ -133,27 +134,45 @@ def test_a_forecast_over_fresh_data_is_anchored_at_today() -> None:
     )
 
     assert anchor == today
-    assert _stale_anchor_note(anchor, now=today) is None
+    assert (
+        _stale_data_note(
+            _data_edge(
+                "PREDICT SUM(orders.amt, 0, 30, days) FOR EACH customers.customer_id",
+                warehouse,
+                {"orders": "ts"},
+                table_names={"orders": "main.orders"},
+            ),
+            now=today,
+        )
+        is None
+    )
 
 
-def test_a_forecast_over_stale_data_says_where_it_is_anchored() -> None:
-    """The data stopped a year ago; the answer is not about next month."""
+def test_a_forecast_over_stale_data_is_still_anchored_today_and_says_so() -> None:
+    """The data stopped a year ago; the forecast is still anchored today, but
+    the reader has to know the history behind it is stale."""
     today = pd.Timestamp("2026-08-28")
     warehouse = _Warehouse("2025-06-30")
+    pql = "PREDICT SUM(orders.amt, 0, 30, days) FOR EACH customers.customer_id"
 
     anchor = _forecast_anchor(
-        "PREDICT SUM(orders.amt, 0, 30, days) FOR EACH customers.customer_id",
+        pql,
         warehouse,
         {"orders": "ts"},
         now=today,
         table_names={"orders": "main.orders"},
     )
-    note = _stale_anchor_note(anchor, now=today)
+    note = _stale_data_note(
+        _data_edge(
+            pql, warehouse, {"orders": "ts"}, table_names={"orders": "main.orders"}
+        ),
+        now=today,
+    )
 
-    assert anchor < today
+    assert anchor == today
     assert note is not None
-    assert str(anchor.date()) in note
-    assert "not from today" in note
+    assert "2025-06-30" in note
+    assert "数据截止到" in note
 
 
 def test_a_warehouse_loaded_on_a_delay_is_not_flagged_every_time() -> None:
@@ -162,12 +181,12 @@ def test_a_warehouse_loaded_on_a_delay_is_not_flagged_every_time() -> None:
 
     within = today - pd.Timedelta(days=_STALE_ANCHOR_DAYS)
 
-    assert _stale_anchor_note(within, now=today) is None
-    assert _stale_anchor_note(within - pd.Timedelta(days=1), now=today) is not None
+    assert _stale_data_note(within, now=today) is None
+    assert _stale_data_note(within - pd.Timedelta(days=1), now=today) is not None
 
 
-def test_the_window_never_runs_past_where_the_data_stops() -> None:
-    """A window with no data in it is what makes a prediction collapse."""
+def test_the_window_is_the_future_even_when_the_data_ends_today() -> None:
+    """A forecast from today must not be pulled back to the last warehouse row."""
     today = pd.Timestamp("2026-08-28")
     last_day = pd.Timestamp("2026-09-10")
     warehouse = _Warehouse(str(last_day.date()))
@@ -180,11 +199,12 @@ def test_the_window_never_runs_past_where_the_data_stops() -> None:
         table_names={"orders": "main.orders"},
     )
 
-    assert anchor + pd.Timedelta(days=90) <= last_day
+    assert anchor == today
+    assert anchor + pd.Timedelta(days=90) > last_day
 
 
-def test_no_anchor_means_no_claim_about_one() -> None:
-    assert _stale_anchor_note(None) is None
+def test_no_data_edge_means_no_claim_about_one() -> None:
+    assert _stale_data_note(None) is None
 
 
 def test_a_stale_dataset_still_supplies_real_spellings() -> None:
@@ -192,13 +212,16 @@ def test_a_stale_dataset_still_supplies_real_spellings() -> None:
     today = pd.Timestamp("2026-08-28")
     warehouse = _Warehouse("2025-06-30")
 
-    anchor = _forecast_anchor(
-        "PREDICT SUM(orders.amt, 0, 30, days) FOR EACH customers.customer_id",
-        warehouse,
-        {"orders": "ts"},
-        now=today,
-        table_names={"orders": "main.orders"},
+    assert (
+        _stale_data_note(
+            _data_edge(
+                "PREDICT SUM(orders.amt, 0, 30, days) FOR EACH customers.customer_id",
+                warehouse,
+                {"orders": "ts"},
+                table_names={"orders": "main.orders"},
+            ),
+            now=today,
+        )
+        is not None
     )
-
-    assert _stale_anchor_note(anchor, now=today) is not None
     assert repr("Enterprise") in _reference()

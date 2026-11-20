@@ -44,6 +44,7 @@ from auto_ontology.retrieval.kumo.graph_cache import (
     catalog_fingerprint,
     join_fingerprint,
 )
+from auto_ontology.retrieval.kumo.hosted import hosted_enabled, hosted_url
 from auto_ontology.retrieval.kumo.pql_gen import quote_ident
 from auto_ontology.retrieval.kumo.kumo_model import key_columns
 from auto_ontology.retrieval.kumo.telemetry import (
@@ -669,6 +670,15 @@ def _worth_keeping(built: Any) -> bool:
     return built.identity.edges_from != "inferred"
 
 
+def _engine_version() -> str:
+    """The engine package version, imported only when the NIM backend is in use."""
+    try:
+        import kumo_relational_client
+    except Exception:  # noqa: BLE001 - a hosted-only image has no engine package
+        return ""
+    return str(getattr(kumo_relational_client, "__version__", ""))
+
+
 def _cache_key(
     connectors: list[Any],
     relevant_tables: list[dict[str, Any]],
@@ -690,8 +700,12 @@ def _cache_key(
     connector = _connector_identity(connectors)
     if connector is None:
         return None
-    import kumo_relational_client
 
+    # The cached context carries the model handle, so the two backends must not
+    # share an entry: switching KUMO_*_API_URL would otherwise serve a handle
+    # that talks to the other endpoint.
+    url = hosted_url()
+    backend = f"hosted@{url}" if url else f"nim@{_engine_version()}"
     return CacheKey(
         connector=connector,
         database=next(iter(databases)),
@@ -703,7 +717,7 @@ def _cache_key(
         schema_fingerprint=catalog_fingerprint(relevant_tables),
         join_fingerprint=join_fingerprint(join_paths),
         prompt_version=PROMPT_VERSION,
-        engine_version=str(getattr(kumo_relational_client, "__version__", "")),
+        engine_version=backend,
     )
 
 
@@ -784,12 +798,19 @@ def _build_context_within_budget(
     examples: list[dict[str, str]] | None,
 ) -> "PredictionContext | dict[str, Any]":
     """Read the tables and build the graph and model over them."""
-    import kumo_relational_client
-    from kumo_relational_client import relational as rfm
-
     from auto_ontology.retrieval.kumo.kumo_model import KumoModel, build_graph_context
 
-    client = _ensure_init()
+    # The hosted path resolves the PQL locally and posts a materialised task, so
+    # it needs neither the engine client nor the engine's graph: its graph is
+    # described straight from the frames (see framed_graph).
+    hosted: Any = None
+    client: Any = None
+    if hosted_enabled():
+        from auto_ontology.retrieval.kumo.hosted import HostedConfig
+
+        hosted = HostedConfig.from_env()
+    else:
+        client = _ensure_init()
 
     logger.info(
         "kumo: loading sample rows for %d relevant table(s)...",
@@ -812,19 +833,33 @@ def _build_context_within_budget(
     )
 
     _graph_start = time.perf_counter()
-    # Passing an explicit empty edge list suppresses LocalGraph's automatic
-    # relationship inference. This lets catalog join paths take precedence and
-    # avoids inferring the same links twice.
-    graph = rfm.Graph.from_data(
-        frames,
-        edges=[],
-        infer_metadata=True,
-        verbose=False,
-    )
-    logger.info(
-        "kumo: LocalGraph.from_data (metadata inferred) in %.2fs",
-        time.perf_counter() - _graph_start,
-    )
+    if hosted is not None:
+        from auto_ontology.retrieval.kumo.framed_graph import build_framed_graph
+
+        # No inference here: the frames already say what the columns are. Links
+        # are stated separately, once the catalog's join paths are known.
+        graph: Any = build_framed_graph(frames, catalog_keys)
+        logger.info(
+            "kumo: framed graph described from %d table(s) in %.2fs",
+            len(frames),
+            time.perf_counter() - _graph_start,
+        )
+    else:
+        from kumo_relational_client import relational as rfm
+
+        # Passing an explicit empty edge list suppresses LocalGraph's automatic
+        # relationship inference. This lets catalog join paths take precedence
+        # and avoids inferring the same links twice.
+        graph = rfm.Graph.from_data(
+            frames,
+            edges=[],
+            infer_metadata=True,
+            verbose=False,
+        )
+        logger.info(
+            "kumo: LocalGraph.from_data (metadata inferred) in %.2fs",
+            time.perf_counter() - _graph_start,
+        )
     # Before any linking: an edge is oriented towards a primary key, so a table whose
     # key inference missed can take part in no relationship at all.
     spend.check_deadline("declaring keys")
@@ -832,7 +867,7 @@ def _build_context_within_budget(
     covered = _apply_join_paths(graph, join_paths)
     if covered:
         logger.info("kumo: using %d catalog join edge(s)", covered)
-    else:
+    if hosted is None and not covered:
         # No usable catalog join paths — fall back to KumoRFM's link heuristics.
         logger.info("kumo: no catalog join paths; inferring links heuristically")
         try:
@@ -842,11 +877,29 @@ def _build_context_within_budget(
             logger.exception(
                 "kumo: infer_links failed; proceeding without inferred links"
             )
+    elif hosted is not None:
+        from auto_ontology.retrieval.kumo.framed_graph import infer_links_by_name
+
+        inferred = infer_links_by_name(graph, frames)
+        logger.info(
+            "kumo: hosted graph supplemented with %d conservative link(s) by matching keys",
+            inferred,
+        )
 
     spend.check_deadline("building the graph")
     graph_ddl, edges, col_stypes, time_columns = build_graph_context(graph)
     spend.check_deadline("creating the model")
-    kumo_model = KumoModel(client.relational(graph), graph)
+    if hosted is not None:
+        from auto_ontology.retrieval.kumo.hosted import HostedKumoModel
+
+        kumo_model: Any = HostedKumoModel(graph, frames, hosted, col_stypes=col_stypes)
+        logger.info(
+            "kumo: hosted backend selected (%s), history anchors=%d",
+            hosted.url,
+            hosted.history_anchors,
+        )
+    else:
+        kumo_model = KumoModel(client.relational(graph), graph)
     entity_ids = _entity_ids(graph, frames)
 
     # Entity-selection SQL runs against the live Auto Ontology database connection (the
@@ -865,7 +918,9 @@ def _build_context_within_budget(
         column_reference=build_column_reference(relevant_tables or [], col_stypes),
         identity=GraphIdentity(
             fingerprint=built_graph_fingerprint(graph),
-            engine_version=str(getattr(kumo_relational_client, "__version__", "")),
+            engine_version=(
+                f"hosted@{hosted.url}" if hosted is not None else _engine_version()
+            ),
             prompt_version=PROMPT_VERSION,
             tables=len(frames),
             rows=int(sum(len(frame) for frame in frames.values())),
