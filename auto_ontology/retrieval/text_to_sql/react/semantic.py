@@ -36,6 +36,8 @@ from auto_ontology.retrieval.text_to_sql.semantic_ir import (
     build_semantic_ir,
 )
 from auto_ontology.retrieval.text_to_sql.time_anchor import (
+    DataWindow,
+    ResolvedTimeRange,
     format_time_anchor_section,
     resolve_time_ranges,
 )
@@ -73,6 +75,20 @@ class SemanticContext:
     @property
     def is_empty(self) -> bool:
         return not self.ir and not self.grounded_metrics
+
+
+@dataclass(frozen=True)
+class TimeAnchor:
+    """The data's calendar and the question's phrases resolved against it."""
+
+    window: DataWindow
+    resolved: list[ResolvedTimeRange]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "window": self.window.as_dict(),
+            "resolved": [item.as_dict() for item in self.resolved],
+        }
 
 
 def build_semantic_context(
@@ -224,30 +240,48 @@ def answer_language_note(question: str) -> str:
     )
 
 
-def build_time_anchor(
+def resolve_time_anchor(
     context: SemanticContext | None,
     connector: Any,
     tables: list[dict[str, Any]],
-) -> str:
+) -> TimeAnchor | None:
     """Resolve the question's relative time phrases on the data's calendar.
 
     The window is probed from the live connection because the catalog stores no
     column statistics, and the failure this prevents — ``最近12个月`` compiled
     against a snapshot that stopped years ago, returning zero rows — reads as a
-    data-quality problem rather than a date problem. A failed probe leaves the
-    episode unanchored rather than guessing ``now()``.
+    data-quality problem rather than a date problem. A failed probe returns
+    ``None`` rather than guessing ``now()``.
     """
     if context is None or not context.ir or not context.ir.get("time_ranges"):
-        return ""
+        return None
     if connector is None or not tables:
-        return ""
+        return None
     try:
         window = probe_data_window(connector, tables)
         resolved = resolve_time_ranges(context.ir.get("time_ranges"), window)
-        return format_time_anchor_section(resolved, window)
     except Exception:  # noqa: BLE001 - anchoring is an enhancement, not a gate
         logger.warning("time anchoring failed", exc_info=True)
+        return None
+    if window is None or not window.usable or not resolved:
+        return None
+    return TimeAnchor(window=window, resolved=resolved)
+
+
+def format_time_anchor(anchor: TimeAnchor | None) -> str:
+    """Render a resolved anchor as the prompt section, or ``""``."""
+    if anchor is None:
         return ""
+    return format_time_anchor_section(anchor.resolved, anchor.window)
+
+
+def build_time_anchor(
+    context: SemanticContext | None,
+    connector: Any,
+    tables: list[dict[str, Any]],
+) -> str:
+    """Resolve and render the anchor in one call, for prompt-only callers."""
+    return format_time_anchor(resolve_time_anchor(context, connector, tables))
 
 
 def format_semantic_context(context: SemanticContext | None) -> str:
@@ -408,6 +442,7 @@ def format_metric_bindings_section(
 
 __all__ = [
     "SemanticContext",
+    "TimeAnchor",
     "answer_language_note",
     "build_semantic_context",
     "build_time_anchor",
@@ -415,4 +450,6 @@ __all__ = [
     "format_metric_bindings_section",
     "format_metric_semantics_section",
     "format_semantic_context",
+    "format_time_anchor",
+    "resolve_time_anchor",
 ]

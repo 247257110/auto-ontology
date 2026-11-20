@@ -86,6 +86,7 @@ class ToolContext:
     prediction_refusal: str = ""
     semantic_context: Any = None
     time_anchor_section: str = ""
+    time_anchor: dict[str, Any] | None = None
     pages: list[Any] = field(default_factory=list)
     shown_tables: set[tuple[str, str]] = field(default_factory=set)
     cost_status: Callable[[], str | None] | None = None

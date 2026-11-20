@@ -148,6 +148,8 @@ class ReactSQLAgent(BaseAgent):
         path_state["react_trajectory"] = result.trajectory
         path_state["react_end_reason"] = result.reason
         path_state["relevant_tables"] = list(ctx.seen_tables.values())
+        if ctx.time_anchor:
+            path_state["time_anchor"] = ctx.time_anchor
 
         if result.prediction is not None:
             response = result.prediction.response

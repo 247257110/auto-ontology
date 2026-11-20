@@ -63,7 +63,10 @@ from auto_ontology.retrieval.data_access.candidates import _get_candidates_infor
 from auto_ontology.retrieval.text_to_sql.react import config
 from auto_ontology.retrieval.text_to_sql.react.context import ToolContext
 from auto_ontology.retrieval.text_to_sql.react.run_sql import connector_for
-from auto_ontology.retrieval.text_to_sql.react.semantic import build_time_anchor
+from auto_ontology.retrieval.text_to_sql.react.semantic import (
+    format_time_anchor,
+    resolve_time_anchor,
+)
 from auto_ontology.retrieval.text_to_sql.react.siblings import sibling_lines
 from auto_ontology.semantic.constants import (
     LABEL_COLUMN_ATTRIBUTE,
@@ -836,9 +839,13 @@ def _time_anchor(ctx: ToolContext) -> str:
     context = getattr(ctx, "semantic_context", None)
     if context is None:
         return ""
-    anchor = build_time_anchor(
+    anchor = resolve_time_anchor(
         context, connector_for(ctx), list(ctx.seen_tables.values())
     )
-    if anchor:
-        ctx.time_anchor_section = anchor
-    return anchor
+    if anchor is None:
+        return ""
+    ctx.time_anchor = anchor.as_dict()
+    section = format_time_anchor(anchor)
+    if section:
+        ctx.time_anchor_section = section
+    return section
