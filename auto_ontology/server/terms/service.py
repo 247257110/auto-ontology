@@ -88,6 +88,45 @@ def list_terms_page(
     }
 
 
+def create_term(
+    *,
+    name: str,
+    description: str | None = None,
+    synonyms: list[str] | None = None,
+    table_ids: list[str] | None = None,
+    name_certified: bool = False,
+    description_certified: bool = False,
+    owner_id: str | None = None,
+    created_by: str | None = None,
+) -> dict[str, Any]:
+    """Create a Term, then embed it so retrieval can find it immediately.
+
+    The embedding is what makes the Term real: a row in ``term`` with no vector
+    is invisible to every search, so a create that skipped this would appear to
+    succeed and change nothing. Failure to embed is logged rather than raised —
+    the Term exists, and a semantic reindex fixes a stale index.
+    """
+    row = terms_dal.create_term(
+        name=name,
+        description=description,
+        synonyms=synonyms,
+        table_ids=table_ids,
+        name_certified=name_certified,
+        description_certified=description_certified,
+        owner_id=owner_id,
+        created_by=created_by,
+    )
+    try:
+        refresh_term_embeddings(row["id"], refresh_dependent_attrs=False)
+    except Exception:
+        logger.warning(
+            "Created Term %r but could not embed it; reindex to make it retrievable",
+            row["name"],
+            exc_info=True,
+        )
+    return row
+
+
 def update_column_attribute(
     term_id: str,
     attr_id: str,

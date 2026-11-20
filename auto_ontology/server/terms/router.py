@@ -18,6 +18,7 @@ from auto_ontology.server.identity import resolve_internal_user
 from auto_ontology.server.owners import enforce_edit, owner_from_body
 from auto_ontology.server.pagination import LIMIT_QUERY, SKIP_QUERY
 from auto_ontology.server.terms import service as term_service
+from auto_ontology.semantic.chinese import normalize_aliases
 from auto_ontology.server.responses import (
     ColumnAttributePageResponse,
     ColumnAttributePatchResponse,
@@ -36,6 +37,25 @@ class TermUpdate(BaseModel):
     description: str | None = None
     name_certified: bool | None = None
     description_certified: bool | None = None
+    owner_id: str | None = None
+    synonyms: list[str] | None = None
+
+
+class TermCreate(BaseModel):
+    """A Term created by hand rather than by compilation.
+
+    ``table_ids`` is what makes a *concept* Term possible: "客户地域" owns no
+    single table, it spans customers → cities → stateprovinces. Every read
+    filters on a Term having at least one represented table, so a Term created
+    with no links would be invisible to the glossary and to retrieval.
+    """
+
+    name: str = Field(min_length=1)
+    description: str | None = None
+    synonyms: list[str] | None = None
+    table_ids: list[str] = Field(default_factory=list)
+    name_certified: bool = False
+    description_certified: bool = False
     owner_id: str | None = None
 
 
@@ -137,6 +157,9 @@ def update_column_attribute(
             status_code=422, detail="No ColumnAttribute fields to update"
         )
 
+    if "synonyms" in patch:
+        patch["synonyms"] = normalize_aliases(patch["synonyms"])
+
     name = patch.get("name")
     if isinstance(name, str):
         name = name.strip()
@@ -230,6 +253,7 @@ def update_term(request: Request, term_id: str, body: TermUpdate) -> dict:
         name_certified=patch.get("name_certified"),
         description_certified=patch.get("description_certified"),
         owner_id=owner_id,
+        synonyms=patch.get("synonyms"),
         set_owner=set_owner,
         modified_by=resolve_internal_user(request, required=False),
         touch=True,
@@ -237,19 +261,26 @@ def update_term(request: Request, term_id: str, body: TermUpdate) -> dict:
     if row is None:
         raise HTTPException(status_code=404, detail="Term not found")
 
-    # Certification flags carry no embedding content; only name/description
-    # changes need suggestion invalidation and a VDB refresh.
-    content_changed = "name" in patch or "description" in patch
+    # Name/description/synonyms feed the embedding text; the certification
+    # flags ride in the VDB metadata (ranking). Either kind needs a refresh.
+    content_changed = any(
+        field in patch for field in ("name", "description", "synonyms")
+    )
+    certification_changed = any(
+        field in patch for field in ("name_certified", "description_certified")
+    )
     name_changed = (
         content_changed and (row.get("old_name") or "").strip() != row["name"].strip()
     )
     if name_changed:
         sql_attr_dal.clear_sql_attribute_description_suggestions_for_term(term_id)
 
-    if content_changed:
+    if content_changed or certification_changed:
         try:
             term_service.refresh_term_embeddings(
-                term_id, refresh_dependent_attrs=name_changed
+                term_id,
+                refresh_dependent_attrs=content_changed
+                and (name_changed or "synonyms" in patch),
             )
         except Exception:
             logger.warning(
@@ -265,6 +296,49 @@ def update_term(request: Request, term_id: str, body: TermUpdate) -> dict:
             "description_certified": row.get("description_certified", False),
             "owner_id": row.get("owner_id"),
             "certification": terms_dal.get_term_certification(term_id),
+        }
+    }
+
+
+@router.post("/terms", status_code=201, response_model=TermResponse)
+def create_term(request: Request, body: TermCreate) -> dict:
+    """Create a Term, optionally representing several tables at once.
+
+    Compilation only allocates one Term per table, which cannot express a
+    concept spread across a join path. This is the write path for those.
+
+    Returns 409 when a Term with this name already exists, and 422 when the
+    name is blank or a ``table_ids`` entry is not in the catalog. The Term is
+    embedded before the response so it is immediately retrievable.
+    """
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Term name cannot be blank")
+
+    owner_id = body.owner_id
+    if owner_id is not None:
+        owner_id = owner_from_body(owner_id, CATALOG_EDIT)
+
+    try:
+        row = term_service.create_term(
+            name=name,
+            description=body.description,
+            synonyms=normalize_aliases(body.synonyms) if body.synonyms else None,
+            table_ids=list(dict.fromkeys(body.table_ids)),
+            name_certified=body.name_certified,
+            description_certified=body.description_certified,
+            owner_id=owner_id,
+            created_by=resolve_internal_user(request, required=False),
+        )
+    except terms_dal.TermNameConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    return {
+        "data": {
+            **row,
+            "certification": terms_dal.get_term_certification(row["id"]),
         }
     }
 

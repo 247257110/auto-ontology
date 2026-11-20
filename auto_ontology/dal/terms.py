@@ -67,6 +67,14 @@ from auto_ontology.utils.sample_values import stringify_sample_values
 logger = logging.getLogger(__name__)
 
 
+class TermNameConflict(ValueError):
+    """A Term with this name already exists.
+
+    ``(name, source)`` is a unique constraint, so a create cannot proceed; the
+    caller turns this into a 409 rather than merging into the existing Term.
+    """
+
+
 def _with_parsed_sample_values(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Render ``sample_values`` on each row as the string list callers expect.
 
@@ -338,6 +346,7 @@ def update_term(
     name_certified: bool | None = None,
     description_certified: bool | None = None,
     owner_id: str | None = None,
+    synonyms: list[str] | None = None,
     set_owner: bool = False,
     modified_by: str | None = None,
     touch: bool = False,
@@ -378,6 +387,8 @@ def update_term(
             ),
             "owner_id": (literal(owner_id, String) if set_owner else s.term.c.owner_id),
         }
+        if synonyms is not None:
+            values["synonyms"] = synonyms
         # Only an edit from the app. Compilation calls this without ``touch``
         # and must not look like someone saved the term.
         if touch:
@@ -528,6 +539,101 @@ def upsert_table_term(
             return term_id, candidate_name
 
     raise RuntimeError(f"Could not allocate a private Term name for table {table_id}")
+
+
+def create_term(
+    *,
+    name: str,
+    description: str | None = None,
+    synonyms: list[str] | None = None,
+    table_ids: list[str] | None = None,
+    name_certified: bool = False,
+    description_certified: bool = False,
+    owner_id: str | None = None,
+    created_by: str | None = None,
+) -> dict[str, Any]:
+    """Create a Term representing one or more tables.
+
+    Compilation only ever allocates one Term per table, which cannot express a
+    *concept*: "客户地域" spans customers → cities → stateprovinces and owns no
+    single table. Linking several tables is what makes such a Term visible at
+    all — every read filters on a represented table existing.
+
+    Raises :class:`TermNameConflict` when ``(name, 'semantic')`` is taken.
+    ``table_ids`` is required and must be non-empty: a Term that represents no
+    table is excluded from every read by construction.
+    """
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError("Term name cannot be blank")
+    table_ids = list(table_ids or [])
+    if not table_ids:
+        raise ValueError(
+            "A Term must represent at least one table; without one it is neither "
+            "listed nor retrievable"
+        )
+
+    with write_transaction():
+        conflict = store().query_read(
+            select(s.term.c.id).where(
+                s.term.c.name == cleaned, s.term.c.source == SEMANTIC_SOURCE
+            )
+        )
+        if conflict:
+            raise TermNameConflict(
+                f"Term named {cleaned!r} already exists (id={conflict[0]['id']!r})"
+            )
+
+        known_tables = {
+            row["id"]
+            for row in store().query_read(
+                select(s.catalog_table.c.id).where(
+                    s.catalog_table.c.id.in_(list(table_ids))
+                )
+            )
+        }
+        unknown = [table_id for table_id in table_ids if table_id not in known_tables]
+        if unknown:
+            raise ValueError(f"Unknown table id(s): {', '.join(unknown)}")
+
+        inserted = store().query_write(
+            insert(s.term)
+            .values(
+                name=cleaned,
+                source=SEMANTIC_SOURCE,
+                description=description or "",
+                synonyms=synonyms or [],
+                name_certified=name_certified,
+                description_certified=description_certified,
+                owner_id=owner_id,
+                created_by=created_by,
+                modified_by=created_by,
+            )
+            .returning(s.term.c.id)
+        )
+        term_id = inserted[0]["id"]
+
+        store().query_write(
+            insert(s.table__term)
+            .values(
+                [
+                    {"term_id": term_id, "table_id": table_id}
+                    for table_id in dict.fromkeys(table_ids)
+                ]
+            )
+            .on_conflict_do_nothing()
+        )
+
+    return {
+        "id": term_id,
+        "name": cleaned,
+        "description": description or "",
+        "synonyms": synonyms or [],
+        "name_certified": name_certified,
+        "description_certified": description_certified,
+        "owner_id": owner_id,
+        "table_count": len(dict.fromkeys(table_ids)),
+    }
 
 
 def fetch_term_synonyms(attr_ids: list[str]) -> dict[str, list[str]]:
@@ -705,6 +811,106 @@ def fetch_all_terms_and_attributes(
         statement = statement.where(s.catalog_table.c.id.in_(table_ids))
 
     return terms, [dict(r) for r in store().query_read(statement)]
+
+
+def _database_table_ids(database_name: str) -> list[str]:
+    """Table ids for one database, for scoping global Term nodes."""
+    rows = store().query_read(
+        select(s.catalog_table.c.id)
+        .select_from(
+            s.catalog_table.join(
+                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
+            ).join(
+                s.catalog_database,
+                s.catalog_database.c.id == s.catalog_schema.c.database_id,
+            )
+        )
+        .where(s.catalog_database.c.name == database_name)
+    )
+    return [r["id"] for r in rows]
+
+
+def fetch_terms_and_attributes_for_database(
+    database_name: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """``(terms, attrs)`` scoped to one database — the reindex work list.
+
+    Term nodes are global (no ``database_name`` column of their own), so scoping
+    goes through the tables that represent them. Attributes are scoped by their
+    owning table's database. Both carry their certification flags so a re-embed
+    can preserve the retrieval-ranking metadata.
+    """
+    table_ids = _database_table_ids(database_name)
+    if not table_ids:
+        return [], []
+
+    terms = store().query_read(
+        select(
+            s.term.c.name,
+            s.term.c.description,
+            s.term.c.synonyms,
+            s.term.c.id,
+            s.term.c.name_certified,
+            s.term.c.description_certified,
+            func.array_agg(func.distinct(s.catalog_schema.c.name)).label(
+                "schema_names"
+            ),
+            func.min(s.catalog_table.c.table_type).label("table_type"),
+        )
+        .select_from(
+            s.table__term.join(s.term, s.term.c.id == s.table__term.c.term_id)
+            .join(s.catalog_table, s.catalog_table.c.id == s.table__term.c.table_id)
+            .join(
+                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
+            )
+        )
+        .where(
+            s.term.c.source == SEMANTIC_SOURCE,
+            s.table__term.c.table_id.in_(table_ids),
+        )
+        .group_by(s.term.c.id)
+        .order_by(func.lower(s.term.c.name), s.term.c.id)
+    )
+
+    attrs = store().query_read(
+        select(
+            s.column_attribute.c.name,
+            s.column_attribute.c.description,
+            s.column_attribute.c.term_name,
+            s.column_attribute.c.source_column,
+            s.catalog_column.c.name.label("column_name"),
+            s.catalog_column.c.description.label("column_description"),
+            attribute_family_prefix(s.column_attribute.c.id).label("family_prefix"),
+            s.catalog_column.c.sample_values,
+            s.catalog_column.c.is_unique,
+            s.catalog_table.c.id.label("table_id"),
+            s.catalog_table.c.name.label("table_name"),
+            s.catalog_table.c.table_type,
+            s.column_attribute.c.id,
+            s.catalog_schema.c.name.label("schema_name"),
+            s.column_attribute.c.datatype,
+            s.column_attribute.c.certified,
+        )
+        .select_from(
+            s.column_attribute.join(
+                s.column__has_attribute,
+                s.column__has_attribute.c.attribute_id == s.column_attribute.c.id,
+            )
+            .join(
+                s.catalog_column,
+                s.catalog_column.c.id == s.column__has_attribute.c.column_id,
+            )
+            .join(s.catalog_table, s.catalog_table.c.id == s.catalog_column.c.table_id)
+            .join(
+                s.catalog_schema, s.catalog_schema.c.id == s.catalog_table.c.schema_id
+            )
+        )
+        .where(
+            s.column_attribute.c.source == SEMANTIC_SOURCE,
+            s.catalog_table.c.id.in_(table_ids),
+        )
+    )
+    return [dict(r) for r in terms], [dict(r) for r in attrs]
 
 
 def get_full_term_by_id(

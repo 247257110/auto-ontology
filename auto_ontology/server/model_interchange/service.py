@@ -24,6 +24,7 @@ from ossie_nvidia_auto_ontology import (
 from auto_ontology.connectors import get_connectors
 from auto_ontology.dal import model_interchange as dal
 from auto_ontology.dal.connections import list_connections
+from auto_ontology.server.model_interchange.consistency import check_ossie_text
 from auto_ontology.server.model_interchange.embed import (
     ImportEmbedBuffer,
     flush_import_embeddings,
@@ -201,6 +202,27 @@ def export_model(request: ExportRequest) -> str:
     if request.format is ModelFormat.OSSIE:
         return convert_auto_ontology_to_ossie(_ossie_source(document))
     return _dump_yaml(document)
+
+
+def _build_ossie_text(document: Any) -> str:
+    """The Ossie document for *document*, without narrowing *document* itself.
+
+    ``_ossie_source`` projects a deep copy onto one table per term, so the
+    native document is intact afterwards — which is what lets the consistency
+    check report what the conversion dropped.
+    """
+    return convert_auto_ontology_to_ossie(_ossie_source(document))
+
+
+def check_model(request: ExportRequest) -> dict[str, Any]:
+    """Export the scoped model as Ossie and report what a reviewer must know.
+
+    Same cost as an export (it *is* one), which is why it is an on-demand
+    endpoint behind a settings page rather than something the chat path pays
+    for.
+    """
+    document = _export_document(request)
+    return check_ossie_text(_build_ossie_text(document), native=document).as_dict()
 
 
 def export_ossie_documents(request: ExportRequest) -> bytes:
