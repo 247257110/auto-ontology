@@ -233,6 +233,7 @@ def _doc_to_embed_row(
         "name": item.get("name", ""),
         "source_path": path,
         "database_name": database_name,
+        "certified": bool(item.get("certified", False)),
     }
     return {
         "text": (item.get("text") or "").strip(),

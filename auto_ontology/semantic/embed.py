@@ -10,6 +10,12 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+from auto_ontology.semantic.chinese import (
+    contains_cjk,
+    format_aliases,
+    normalize_chinese_text,
+)
+from auto_ontology.semantic.relation_kind import classify_name
 from auto_ontology.utils.embedding import EmbedParams, batch_embed
 from auto_ontology.utils.model_config import resolve
 from auto_ontology.utils.sample_values import stringify_sample_values
@@ -216,6 +222,17 @@ def _format_sample_values(raw: Any, data_type: str | None = None) -> str:
     return f" {SAMPLE_VALUES_MARKER} " + ", ".join(values) + "."
 
 
+def _term_certified(term: dict[str, Any]) -> bool:
+    """A Term's vetted status, tolerant of the fetch shapes callers use.
+
+    An explicit ``certified`` boolean wins when present; otherwise both
+    persisted flags must be true. Missing everything means uncertified.
+    """
+    if term.get("certified") is not None:
+        return bool(term.get("certified"))
+    return bool(term.get("name_certified")) and bool(term.get("description_certified"))
+
+
 def _build_rows(
     database_name: str,
     term: dict[str, Any],
@@ -225,7 +242,11 @@ def _build_rows(
 
     term_name = term.get("name")
     if term_name:
-        text = f"Term: {term_name}. {term.get('description') or ''}".strip()
+        description = normalize_chinese_text(str(term.get("description") or ""))
+        aliases = format_aliases(term.get("synonyms"))
+        text = f"Term: {term_name}. {description}".strip()
+        if aliases:
+            text += f" Aliases: {aliases}."
         path = f"semantic:term:{term_name}"
         fields: dict[str, Any] = {
             "label": "Term",
@@ -238,6 +259,15 @@ def _build_rows(
         schema_names = [s for s in (term.get("schema_names") or []) if s]
         if schema_names:
             fields["schema_names"] = schema_names
+        if term.get("synonyms"):
+            fields["synonyms"] = format_aliases(term.get("synonyms"))
+        if _term_certified(term):
+            fields["certified"] = True
+        relation_kind = term.get("relation_kind") or classify_name(
+            term_name, term.get("table_type")
+        )
+        if relation_kind:
+            fields["relation_kind"] = relation_kind
         rows.append(
             {
                 "text": text,
@@ -248,7 +278,8 @@ def _build_rows(
         )
 
     term_synonyms: list[str] = term.get("synonyms") or []
-    synonym_suffix = f" ({', '.join(term_synonyms)})" if term_synonyms else ""
+    normalized_synonyms = format_aliases(term_synonyms)
+    synonym_suffix = f" ({normalized_synonyms})" if normalized_synonyms else ""
 
     for a in attrs:
         attr_name = a.get("name")
@@ -261,12 +292,21 @@ def _build_rows(
         # The column's description, never the attribute's: the attribute's is
         # written after FK resolution from its links, and editing it must not
         # move the vector.
+        description = normalize_chinese_text(str(a.get("column_description") or ""))
         text = (
             f"ColumnAttribute: {attr_name} of Term {owner}{synonym_suffix}"
             f"{family_suffix}. "
-            f"{a.get('column_description') or ''}"
+            f"{description}"
             f"{sample_block}"
         ).strip()
+        physical_column = normalize_chinese_text(str(a.get("source_column") or ""))
+        table_name = normalize_chinese_text(str(a.get("table_name") or ""))
+        if physical_column and (
+            contains_cjk(physical_column) or contains_cjk(table_name)
+        ):
+            text += f" Physical column: {physical_column}."
+        if table_name and contains_cjk(table_name):
+            text += f" Table: {table_name}."
         path = (
             f"semantic:attr:{a['id']}"
             if a.get("id")
@@ -297,6 +337,15 @@ def _build_rows(
             fields["data_type"] = a["datatype"]
         if a.get("id"):
             fields["id"] = a["id"]
+        if normalized_synonyms:
+            fields["synonyms"] = normalized_synonyms
+        if a.get("certified"):
+            fields["certified"] = True
+        relation_kind = a.get("relation_kind") or classify_name(
+            a.get("table_name"), a.get("table_type")
+        )
+        if relation_kind:
+            fields["relation_kind"] = relation_kind
         rows.append(
             {
                 "text": text,

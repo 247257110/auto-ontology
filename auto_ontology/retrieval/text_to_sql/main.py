@@ -12,6 +12,11 @@ from auto_ontology.retrieval.text_to_sql.pipeline import create_steps, run_steps
 from auto_ontology.retrieval.text_to_sql.connector_routing import (
     resolve_target_database_name,
 )
+from auto_ontology.retrieval.text_to_sql.database_scope import (
+    configured_default_target_db,
+    configured_prediction_target_db,
+    resolve_effective_target_db,
+)
 from auto_ontology.retrieval.text_to_sql.node_labels import NODE_LABELS
 from auto_ontology.retrieval.text_to_sql.react.agent import STEP_NAME as REACT_STEP
 from auto_ontology.retrieval.text_to_sql.react.config import prediction_enabled
@@ -83,25 +88,38 @@ def _build_state(payload: TextToSQLPayload) -> AgentState:
     if prediction_override is True and not prediction_enabled():
         raise ValueError(
             "prediction=true was requested but the prediction flow is not "
-            "configured on this deployment (KUMO_RFM_API_URL is unset)."
+            "configured on this deployment (neither KUMO_RFM_API_URL nor "
+            "KUMO_HOSTED_API_URL is set)."
         )
 
     initial_path_state = dict(payload.get("path_state") or {})
-
-    target_db = payload.get("target_db")
-    if target_db:
-        initial_path_state["target_db"] = resolve_target_database_name(
-            target_db, connectors
-        )
-    elif len(connectors) == 1:
-        connector_db = getattr(connectors[0], "database_name", None)
-        if connector_db:
-            initial_path_state["target_db"] = connector_db
 
     submitted_question = payload["question"].strip()
     processing_question = (
         payload.get("processing_question") or ""
     ).strip() or submitted_question
+
+    target_db, scope_reason = resolve_effective_target_db(
+        requested=payload.get("target_db"),
+        question_type="prediction" if prediction_override is True else None,
+        question=processing_question,
+        connectors=connectors,
+        default=configured_default_target_db(),
+        prediction_default=configured_prediction_target_db(),
+    )
+    if target_db:
+        initial_path_state["target_db"] = (
+            resolve_target_database_name(target_db, connectors) or target_db
+        )
+        logger.info(
+            "Chat database scope: %s (%s)",
+            initial_path_state["target_db"],
+            scope_reason,
+        )
+    elif len(connectors) == 1:
+        connector_db = getattr(connectors[0], "database_name", None)
+        if connector_db:
+            initial_path_state["target_db"] = connector_db
     # Keep the exact submitted turn separate from a standalone follow-up rewrite.
     initial_path_state["processing_question"] = processing_question
 

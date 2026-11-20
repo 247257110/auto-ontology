@@ -13813,6 +13813,20 @@
               }
             ],
             "title": "Owner Id"
+          },
+          "synonyms": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Synonyms"
           }
         },
         "title": "TermUpdate",

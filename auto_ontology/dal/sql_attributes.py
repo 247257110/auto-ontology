@@ -563,8 +563,8 @@ def delete_sql_attribute_node(attr_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def fetch_sql_attributes_with_sql(attr_ids: list[str]) -> list[dict[str, str]]:
-    """``id, name, description, expression, sql, term_name`` per attribute.
+def fetch_sql_attributes_with_sql(attr_ids: list[str]) -> list[dict[str, object]]:
+    """``id, name, description, expression, sql, term_name, certified`` per attribute.
 
     One row per attribute even when several statements or terms match — the
     first of each id wins, ordered so "first" is reproducible.
@@ -581,6 +581,7 @@ def fetch_sql_attributes_with_sql(attr_ids: list[str]) -> list[dict[str, str]]:
                 s.sql_attribute.c.name,
                 s.sql_attribute.c.description,
                 s.sql_attribute.c.expression,
+                s.sql_attribute.c.certified,
                 _SQL_TEXT.label("sql_text"),
                 s.term.c.name.label("term_name"),
             )
@@ -597,7 +598,7 @@ def fetch_sql_attributes_with_sql(attr_ids: list[str]) -> list[dict[str, str]]:
         logger.warning("fetch_sql_attributes_with_sql: query failed", exc_info=True)
         return []
 
-    result: list[dict[str, str]] = []
+    result: list[dict[str, object]] = []
     seen: set[str] = set()
     for row in rows:
         attr_id = row["attr_id"] or ""
@@ -612,8 +613,60 @@ def fetch_sql_attributes_with_sql(attr_ids: list[str]) -> list[dict[str, str]]:
                 "expression": row["expression"] or "",
                 "sql": row["sql_text"] or "",
                 "term_name": row["term_name"] or "",
+                "certified": bool(row["certified"]),
             }
         )
+    return result
+
+
+def fetch_sql_attribute_databases(attr_ids: list[str]) -> dict[str, set[str]]:
+    """``{attribute_id: {database_name}}`` for the tables each SQL references.
+
+    The table listing collapses attributes that share a table, which is enough
+    for "what does this SQL touch" but not for scoping one attribute to a
+    database. This keeps the attribute id, so a name-matched metric cannot pull
+    a definition from another library into the prompt.
+    """
+    if not attr_ids:
+        return {}
+    try:
+        rows = store().query_read(
+            select(
+                s.sql_attribute__sql.c.attribute_id,
+                s.catalog_database.c.name.label("database_name"),
+            )
+            .select_from(
+                s.sql_attribute__sql.join(
+                    s.sql_query__table,
+                    s.sql_query__table.c.sql_query_id
+                    == s.sql_attribute__sql.c.sql_query_id,
+                )
+                .join(
+                    s.catalog_table,
+                    s.catalog_table.c.id == s.sql_query__table.c.table_id,
+                )
+                .join(
+                    s.catalog_schema,
+                    s.catalog_schema.c.id == s.catalog_table.c.schema_id,
+                )
+                .join(
+                    s.catalog_database,
+                    s.catalog_database.c.id == s.catalog_schema.c.database_id,
+                )
+            )
+            .where(s.sql_attribute__sql.c.attribute_id.in_(list(attr_ids)))
+            .distinct()
+        )
+    except Exception:
+        logger.warning("fetch_sql_attribute_databases: query failed", exc_info=True)
+        return {}
+
+    result: dict[str, set[str]] = {}
+    for row in rows:
+        attr_id = str(row["attribute_id"] or "")
+        database = str(row["database_name"] or "")
+        if attr_id and database:
+            result.setdefault(attr_id, set()).add(database)
     return result
 
 

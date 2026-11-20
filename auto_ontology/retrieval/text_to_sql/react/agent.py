@@ -19,13 +19,22 @@ from auto_ontology.retrieval.text_to_sql.base import BaseAgent, record_thought
 from auto_ontology.retrieval.text_to_sql.models import SQLGenerationModel
 from auto_ontology.retrieval.text_to_sql.react.context import ToolContext
 from auto_ontology.retrieval.text_to_sql.react.loop import run_episode
-from auto_ontology.retrieval.text_to_sql.react.mode import ToolName, episode_mode
+from auto_ontology.retrieval.text_to_sql.react.mode import (
+    EpisodeMode,
+    ToolName,
+    episode_mode,
+)
 from auto_ontology.retrieval.text_to_sql.react.run_sql import connector_for
+from auto_ontology.retrieval.text_to_sql.react.semantic import (
+    build_semantic_context,
+    is_calculation_question,
+)
 from auto_ontology.retrieval.text_to_sql.state import (
     AgentState,
     get_question_for_processing,
     get_standalone_question,
 )
+from auto_ontology.semantic.chinese import contains_cjk
 
 STEP_NAME = "react_sql_agent"
 
@@ -33,8 +42,15 @@ _UNANSWERED = (
     "I couldn't write a query that answers this question from the data I could "
     "find. Try rephrasing it, or name the table or measure you mean."
 )
+_UNANSWERED_ZH = (
+    "我无法根据找到的数据写出能回答这个问题的查询。请换一种问法，或指明要用的表或指标。"
+)
 
 _NO_ASSUMPTIONS = "No assumptions were needed beyond what the question states."
+_NO_ASSUMPTIONS_ZH = "除问题本身之外，未做额外假设。"
+
+_RESULT = "Here is the result of the query."
+_RESULT_ZH = "这是查询结果。"
 
 
 def _tool_thought(call: dict[str, Any]) -> str:
@@ -66,6 +82,8 @@ class ReactSQLAgent(BaseAgent):
 
     def execute(self, state: AgentState) -> Dict[str, Any]:
         path_state = dict(state.get("path_state") or {})
+        processing_question = get_question_for_processing(state)
+        chinese = contains_cjk(processing_question)
         ctx = ToolContext(
             retriever=state.get("semantic_retriever") or state.get("data_retriever"),
             data_retriever=state.get("data_retriever"),
@@ -85,17 +103,49 @@ class ReactSQLAgent(BaseAgent):
         can_run_queries = getattr(connector, "can_run_queries", None)
         if callable(can_run_queries):
             ctx.can_run_queries = can_run_queries
+
+        mode = episode_mode(state.get("prediction_override"))
+        semantic = None
+        semantic_retriever = state.get("semantic_retriever")
+        if mode is not EpisodeMode.PREDICT and semantic_retriever is not None:
+            semantic = build_semantic_context(
+                get_question_for_processing(state),
+                semantic_retriever,
+                database_name=ctx.database_name,
+            )
+            path_state["semantic_ir"] = semantic.ir
+            path_state["grounded_metrics"] = semantic.grounded_metrics
+            ctx.semantic_context = semantic
+            if is_calculation_question(processing_question, semantic.ir):
+                # The answer is a value, not a description of the query. Without
+                # this the model can submit prose and no SQL, which the chat
+                # renders as an answer even though nothing ran.
+                ctx.information_answers = False
+            if semantic.clarification:
+                path_state["metric_clarification_question"] = semantic.clarification
+                if mode is EpisodeMode.SQL:
+                    self.logger.info(
+                        "Metric grounding requires clarification before SQL: %s",
+                        semantic.clarification,
+                    )
+                    path_state["unconstructable_explanation"] = semantic.clarification
+                    return {
+                        "decision": "unconstructable",
+                        "path_state": path_state,
+                    }
+
         result = run_episode(
             state.get("reasoning_llm") or state["llm"],
             ctx,
             question=get_question_for_processing(state),
             evidence=state.get("evidence"),
             dialect=getattr(connector, "dialect", None),
-            mode=episode_mode(state.get("prediction_override")),
+            mode=mode,
             custom_prompts=state.get("custom_prompts"),
             sql_examples=state.get("sql_examples"),
             value_anchors=state.get("value_anchors"),
             shorten_answer=bool(state.get("shorten_answer")),
+            semantic_context=semantic,
         )
 
         for step in result.trajectory:
@@ -104,6 +154,8 @@ class ReactSQLAgent(BaseAgent):
         path_state["react_trajectory"] = result.trajectory
         path_state["react_end_reason"] = result.reason
         path_state["relevant_tables"] = list(ctx.seen_tables.values())
+        if ctx.time_anchor:
+            path_state["time_anchor"] = ctx.time_anchor
 
         if result.prediction is not None:
             response = result.prediction.response
@@ -120,8 +172,8 @@ class ReactSQLAgent(BaseAgent):
         submission = result.submission
         if submission is None:
             self.logger.info("ReAct episode ended without an answer: %s", result.reason)
-            path_state["unconstructable_explanation"] = (
-                ctx.prediction_refusal or _UNANSWERED
+            path_state["unconstructable_explanation"] = ctx.prediction_refusal or (
+                _UNANSWERED_ZH if chinese else _UNANSWERED
             )
             return {"decision": "unconstructable", "path_state": path_state}
 
@@ -143,9 +195,10 @@ class ReactSQLAgent(BaseAgent):
 
         path_state["sql_code"] = submission.sql
         path_state["sql_generation_result"] = SQLGenerationModel(
-            thought=submission.assumptions or _NO_ASSUMPTIONS,
+            thought=submission.assumptions
+            or (_NO_ASSUMPTIONS_ZH if chinese else _NO_ASSUMPTIONS),
             sql_code=submission.sql,
-            response=submission.response or "Here is the result of the query.",
+            response=submission.response or (_RESULT_ZH if chinese else _RESULT),
         )
         path_state["sql_response_from_db"] = submission.db_response.result
         path_state.setdefault("candidates", [])

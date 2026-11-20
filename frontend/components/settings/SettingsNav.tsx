@@ -35,6 +35,10 @@ const IMPORT_EXPORT_NAV_ITEM: NavItem = {
 	label: 'Import / Export',
 	href: '/settings/import-export',
 };
+const SEMANTIC_YAML_NAV_ITEM: NavItem = {
+	label: 'Semantic YAML',
+	href: '/settings/semantic-yaml',
+};
 
 function rowClassName(selected: boolean) {
 	return `flex min-h-9 items-center rounded-lg px-3 text-sm no-underline transition-colors ${
@@ -72,6 +76,7 @@ export const SettingsNav = ({ connectionsEnvManaged }: SettingsNavProps) => {
 		SEMANTIC_COMPILATION_NAV_ITEM,
 		AGENT_SETTINGS_NAV_ITEM,
 		IMPORT_EXPORT_NAV_ITEM,
+		SEMANTIC_YAML_NAV_ITEM,
 	);
 
 	return (

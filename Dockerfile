@@ -65,7 +65,7 @@ COPY vendor/ vendor/
 
 # Resolve and install the dependency closure into /opt/venv.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --no-dev --no-install-project
+    uv sync --no-dev --no-install-project --extra kumo
 
 ############################
 # Stage 2: runtime

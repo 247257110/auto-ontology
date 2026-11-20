@@ -62,6 +62,11 @@ stored values before filtering on them, and to test a draft.
 - submit: give your final query. It is checked and run; if it fails you get \
 the error and can keep working.
 
+A question that asks for a number, a list of rows, or a comparison is a \
+calculation: write and run SQL, and let the result be the answer. Answer in \
+words only for a catalog or definition question, and only from what retrieve \
+showed.
+
 Return exactly the requested output fields and no others.
 
 Aggregate, GROUP BY or LIMIT only when the question or its clarifications ask \
@@ -452,13 +457,18 @@ SUBMIT_TOOL = {
                 "response": {
                     "type": "string",
                     "description": (
-                        "Two to four plain-English sentences for the user: what is "
-                        "calculated, from which data, with which filters."
+                        "Two to four concise sentences for the user: what is "
+                        "calculated, from which data, with which filters. Use the "
+                        "language the question was asked in; keep table and column "
+                        "names and data values exactly as they are."
                     ),
                 },
                 "assumptions": {
                     "type": "string",
-                    "description": "Any choice the question left open, and why.",
+                    "description": (
+                        "Any choice the question left open, and why. Use the "
+                        "language the question was asked in."
+                    ),
                 },
             },
             "required": ["sql", "response"],

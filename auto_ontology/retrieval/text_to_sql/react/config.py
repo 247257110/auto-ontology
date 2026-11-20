@@ -142,10 +142,14 @@ def max_columns_per_table() -> int:
 def prediction_enabled() -> bool:
     """Whether this deployment can answer with a KumoRFM prediction.
 
-    ``KUMO_RFM_API_URL`` must name a Universal TFM NIM serving the
-    ``kumo-relational`` model; without it the ``predict`` tool is never offered.
+    Either ``KUMO_RFM_API_URL`` (a self-hosted Universal TFM NIM) or
+    ``KUMO_HOSTED_API_URL`` (the hosted Relational API) must be configured;
+    without one the ``predict`` tool is never offered.
     """
-    return bool(os.environ.get("KUMO_RFM_API_URL", "").strip())
+    return bool(
+        os.environ.get("KUMO_RFM_API_URL", "").strip()
+        or os.environ.get("KUMO_HOSTED_API_URL", "").strip()
+    )
 
 
 def max_predict_calls() -> int:

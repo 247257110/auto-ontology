@@ -27,11 +27,22 @@ from __future__ import annotations
 import ast
 import json
 import logging
+import os
+import random
+import re
+import time
 from typing import TYPE_CHECKING, Literal
 
 from auto_ontology.catalog.constants import Labels
 
 from auto_ontology.semantic.constants import LABEL_SQL_ATTRIBUTE
+from auto_ontology.semantic.chinese import normalize_chinese_text
+from auto_ontology.semantic.relation_kind import (
+    KIND_TABLE,
+    infer_from_text,
+    is_reference_relation,
+)
+from auto_ontology.retrieval.data_access.reranking import rerank_component
 
 if TYPE_CHECKING:
     from auto_ontology.utils.retriever import Retriever
@@ -52,6 +63,101 @@ PER_LABEL_LIMITS: dict[str, int] = {
     Labels.CUSTOM_ANALYSIS: 3,
     LABEL_SQL_ATTRIBUTE: 3,
 }
+
+# Fetch a wider vector candidate pool, then use the normalized query and the
+# text/aliases stored with each row to recover exact Chinese matches that a
+# multilingual embedding can rank below a semantically similar distractor.
+HYBRID_FETCH_MULTIPLIER = 3
+_ASCII_TOKEN_RE = re.compile(r"[a-z0-9_]+", re.IGNORECASE)
+
+# Rank bonus applied to certified semantic nodes (Term / ColumnAttribute /
+# SqlAttribute) inside the hybrid fusion. It is measured in the same units as
+# ``_lexical_score`` (0..2) and kept well below a full substring match (1.0),
+# so certification breaks ties and near-ties without overriding a genuinely
+# better lexical match.
+CERTIFIED_RANK_BONUS = 0.25
+
+# Rank penalty for a relation that *references* facts rather than being one —
+# a view (``website.customers``) or a purged-history table
+# (``customers_archive``). Analysing through a view picks someone else's join
+# and filter; joining an archive duplicates every entity with more than one
+# version, so a customer count doubles without anything failing.
+#
+# Sized above ``CERTIFIED_RANK_BONUS`` so a certified definition on an archive
+# does not outrank a plain column on a live table at equal lexical evidence —
+# certified means "this wording is right", not "this relation is the source".
+# Still well below an exact lexical match, so a question that *names* the
+# archive ("冷库温度历史", "变更历史") keeps it: 1.0 - 0.45 still beats 0.
+#
+# A soft penalty, not an exclusion, because two live cases need these rows:
+# ``coldroomtemperatures_archive`` is the only place WWI keeps temperature
+# history (the live table has 4 rows), and ``v_customer_last_order`` is a
+# view built precisely to answer a recency question. Operators who find it
+# mis-sized set ``RETRIEVAL_REFERENCE_PENALTY=0`` and are back to the old order.
+REFERENCE_RELATION_PENALTY = 0.45
+
+# ``retriever.query`` embeds the entity text via the remote NIM embeddings
+# endpoint before it can run the vector search — a transient 5xx there
+# (observed as e.g. "502 Bad Gateway") currently has no retry anywhere in the
+# stack and silently degrades that query to zero candidates. These are
+# infrastructure blips, not a signal about the query itself, so retry with
+# backoff instead of failing straight through.
+_EMBED_QUERY_RETRY_MAX_ATTEMPTS = 3
+_EMBED_QUERY_RETRYABLE_TOKENS = (
+    "502",
+    "Bad Gateway",
+    "503",
+    "Service Unavailable",
+    "504",
+    "Gateway Timeout",
+    "Timeout",
+    "Connection",
+)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Whether *exc* is an endpoint blip rather than a problem with the query."""
+    from openai import APIConnectionError, APIStatusError
+
+    # APIConnectionError covers timeouts too, whose message ("Request timed
+    # out.") none of the tokens below would match.
+    if isinstance(exc, APIConnectionError):
+        return True
+    if isinstance(exc, APIStatusError):
+        return exc.status_code in (408, 429) or exc.status_code >= 500
+    return any(tok in str(exc) for tok in _EMBED_QUERY_RETRYABLE_TOKENS)
+
+
+def _query_with_retry(
+    retriever: "Retriever", entity: str, top_k: int, vdb_kwargs: dict | None
+) -> list[dict]:
+    """``retriever.query`` with retry-with-backoff on transient embedding-
+    endpoint errors. Waits between attempts (exponential backoff + jitter,
+    same shape as ``auto_ontology/utils/llm_invoke.py``'s LLM retry) rather than
+    retrying immediately, since a 502/503 needs the endpoint a moment to
+    recover. Non-retryable errors (e.g. a bad query shape) still raise
+    immediately on the first attempt.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(_EMBED_QUERY_RETRY_MAX_ATTEMPTS):
+        try:
+            return retriever.query(entity, top_k=top_k, vdb_kwargs=vdb_kwargs)
+        except Exception as e:
+            last_exc = e
+            if _is_retryable(e) and attempt < _EMBED_QUERY_RETRY_MAX_ATTEMPTS - 1:
+                wait = 2 ** (attempt + 1) + random.uniform(0, 1)
+                logger.warning(
+                    "Retryable embedding error on attempt %d/%d — retrying in "
+                    "%.1fs: %s",
+                    attempt + 1,
+                    _EMBED_QUERY_RETRY_MAX_ATTEMPTS,
+                    wait,
+                    str(e)[:200],
+                )
+                time.sleep(wait)
+                continue
+            raise
+    raise last_exc  # pragma: no cover — loop always returns or raises above
 
 
 def clean_results(raw_candidates: list[dict]) -> list[dict]:
@@ -109,6 +215,159 @@ def _resolve_label_k(per_label_k: "int | dict[str, int]", label: str | None) -> 
     if isinstance(per_label_k, dict):
         return per_label_k.get(label or "", PER_LABEL_LIMIT)
     return int(per_label_k)
+
+
+def _lexical_tokens(value: str) -> set[str]:
+    """Create lightweight mixed Chinese/Latin tokens without a tokenizer."""
+    normalized = normalize_chinese_text(value).lower()
+    tokens = set(_ASCII_TOKEN_RE.findall(normalized))
+    cjk = [ch for ch in normalized if "\u4e00" <= ch <= "\u9fff"]
+    tokens.update(cjk)
+    tokens.update("".join(pair) for pair in zip(cjk, cjk[1:]))
+    return tokens
+
+
+def _lexical_score(query: str, row: dict) -> float:
+    """Score exact/near text matches, with Chinese character n-grams."""
+    query_text = normalize_chinese_text(query).lower()
+    candidate = " ".join(
+        str(row.get(key) or "")
+        for key in ("text", "name", "source", "source_column", "synonyms")
+    )
+    candidate_text = normalize_chinese_text(candidate).lower()
+    if not query_text or not candidate_text:
+        return 0.0
+    score = 0.0
+    if query_text in candidate_text:
+        score += 1.0
+    query_tokens = _lexical_tokens(query_text)
+    candidate_tokens = _lexical_tokens(candidate_text)
+    if query_tokens:
+        score += len(query_tokens & candidate_tokens) / len(query_tokens)
+    return min(score, 2.0)
+
+
+def _reference_penalty() -> float:
+    """The downrank applied to views and archives, read per call.
+
+    Separate from the constant so a deployment can switch it off (or reshape it)
+    without a code change — see the trade-off note on
+    ``REFERENCE_RELATION_PENALTY``.
+    """
+    raw = os.environ.get("RETRIEVAL_REFERENCE_PENALTY")
+    if raw is None or not raw.strip():
+        return REFERENCE_RELATION_PENALTY
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        logger.warning(
+            "RETRIEVAL_REFERENCE_PENALTY=%r is not a number; using %s",
+            raw,
+            REFERENCE_RELATION_PENALTY,
+        )
+        return REFERENCE_RELATION_PENALTY
+
+
+def _exempt_relations() -> set[str]:
+    """Relations that must never be demoted, from the environment.
+
+    Comma-separated table or term names. Exists because one relation can be both
+    things: Wide World Importers keeps its live ``coldroomtemperatures`` table
+    at 4 rows and the whole temperature history in
+    ``coldroomtemperatures_archive``, so the archive *is* the fact source for a
+    threshold question. Name conventions cannot tell that case apart from
+    ``customers_archive``, and reading row counts at retrieval time would cost a
+    database round trip per question — so the deployment, which knows, says so.
+    """
+    raw = os.environ.get("RETRIEVAL_REFERENCE_EXEMPT", "")
+    return {
+        part.strip().casefold()
+        for part in raw.replace(";", ",").split(",")
+        if part.strip()
+    }
+
+
+def _row_relation_kind(row: dict) -> str:
+    """A row's relation kind, from its metadata or from the names it carries.
+
+    Rows embedded before the flag existed fall back to the names: a
+    ColumnAttribute always has its physical ``table_name``, and a Term compiled
+    from an archive table is called "Archived City". Only archives are
+    inferable this way — a view leaves no trace, and demoting one on a guess
+    would be worse than leaving it where it ranks now.
+
+    ``RETRIEVAL_REFERENCE_EXEMPT`` wins over both, for the relation that is a
+    reference by name and a fact source in practice.
+    """
+    exempt = _exempt_relations()
+    if exempt:
+        for value in (row.get("table_name"), row.get("name")):
+            if value and str(value).strip().casefold() in exempt:
+                return KIND_TABLE
+
+    embedded = row.get("relation_kind")
+    if embedded:
+        return str(embedded)
+    return infer_from_text(row.get("table_name"), row.get("name"))
+
+
+def _hybrid_rank_rows(
+    query: str,
+    rows: list[dict],
+    per_label_k: "int | dict[str, int]",
+    rerank_bonus: "dict[str, float] | None" = None,
+) -> list[dict]:
+    """Fuse vector ordering with deterministic lexical evidence.
+
+    Vector distance remains the primary signal. Lexical evidence only breaks
+    close semantic ties and makes aliases/exact Chinese wording observable, and
+    a certified node gets a modest boost on top (see ``CERTIFIED_RANK_BONUS``).
+
+    *rerank_bonus* is an optional ``{id: bonus}`` from a cross-encoder (see
+    ``reranking.rerank_component``). It is **added** to the same sum rather than
+    replacing the order, so a reranker can settle a close call but cannot erase
+    a lexical match or a certification. Absent or empty, the fusion is exactly
+    what it was.
+    """
+    if not rows:
+        return []
+    bonuses = rerank_bonus or {}
+    penalty = _reference_penalty()
+    ranked: list[tuple[float, int, dict]] = []
+    for index, row in enumerate(rows):
+        lexical = _lexical_score(query, row)
+        row["lexical_score"] = lexical
+        # Distance is not calibrated across backends; a rank-based vector
+        # component keeps this fusion stable while lexical matches are strong.
+        # A certified node gets a modest boost (see CERTIFIED_RANK_BONUS) so
+        # vetted semantics win ties and near-ties.
+        certified = CERTIFIED_RANK_BONUS if row.get("certified") else 0.0
+        semantic = bonuses.get(str(row.get("id")), 0.0)
+        if semantic:
+            row["rerank_bonus"] = semantic
+        reference = 0.0
+        if penalty and is_reference_relation(_row_relation_kind(row)):
+            reference = penalty
+            row["reference_penalty"] = reference
+        ranked.append(
+            (
+                index - (lexical + certified + semantic - reference) * len(rows),
+                index,
+                row,
+            )
+        )
+    ranked.sort(key=lambda item: item[0])
+
+    counts: dict[str, int] = {}
+    output: list[dict] = []
+    for _, _, row in ranked:
+        label = str(row.get("label") or "")
+        count = counts.get(label, 0)
+        if count >= _resolve_label_k(per_label_k, label):
+            continue
+        counts[label] = count + 1
+        output.append(row)
+    return output
 
 
 def _escape_like(value: str) -> str:
@@ -227,7 +486,17 @@ def _hits_to_semantic_rows(
             "label": lab,
             "score": score,
         }
-        for _field in ("name", "schema_name", "database_name", "data_type", "source"):
+        for _field in (
+            "name",
+            "schema_name",
+            "database_name",
+            "data_type",
+            "source",
+            "source_column",
+            "synonyms",
+            "certified",
+            "relation_kind",
+        ):
             val = meta.get(_field)
             if val is not None:
                 row[_field] = val
@@ -256,6 +525,7 @@ def search_semantic_index(
     plugged into the retriever — see :func:`_metadata_filter_format`.
     """
     fmt = _metadata_filter_format(retriever)
+    entity = normalize_chinese_text(entity)
 
     allowed_labels = {str(x) for x in (label_filter or []) if x is not None} or None
     labels_to_query = list(allowed_labels) if allowed_labels else [None]
@@ -270,14 +540,25 @@ def search_semantic_index(
         )
         vdb_kwargs = {"where": where_clause} if where_clause else None
         top_k = (
-            _resolve_label_k(per_label_k, label)
+            _resolve_label_k(per_label_k, label) * HYBRID_FETCH_MULTIPLIER
             if where_clause
-            else DEFAULT_FETCH_LIMIT
+            else DEFAULT_FETCH_LIMIT * HYBRID_FETCH_MULTIPLIER
         )
 
-        hits = retriever.query(entity, top_k=top_k, vdb_kwargs=vdb_kwargs)
+        hits = _query_with_retry(retriever, entity, top_k, vdb_kwargs)
         all_hits.extend(hits)
 
-    return _hits_to_semantic_rows(
-        all_hits, label_filter=allowed_labels, per_label_k=per_label_k
+    candidate_k = {
+        label: _resolve_label_k(per_label_k, label) * HYBRID_FETCH_MULTIPLIER
+        for label in (allowed_labels or {None})
+        if label is not None
+    }
+    rows = _hits_to_semantic_rows(
+        all_hits,
+        label_filter=allowed_labels,
+        per_label_k=candidate_k or PER_LABEL_LIMIT * HYBRID_FETCH_MULTIPLIER,
     )
+    # One cross-encoder call over the fused candidate pool. Empty when the
+    # reranker is off, the query's script is not enabled, or the call failed —
+    # all of which leave the fusion exactly as it was.
+    return _hybrid_rank_rows(entity, rows, per_label_k, rerank_component(entity, rows))

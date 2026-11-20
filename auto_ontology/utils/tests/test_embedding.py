@@ -456,3 +456,32 @@ def test_first_attempt_success_does_not_sleep() -> None:
 
     assert result is not None and not result.empty
     assert slept == []
+
+
+def test_doc_metadata_carries_certification(monkeypatch) -> None:
+    from auto_ontology.utils import embedding
+
+    captured: dict = {}
+
+    def capture(rows, *_args, **_kwargs):
+        captured["rows"] = rows
+        return len(rows)
+
+    monkeypatch.setattr(embedding, "embed_rows_into_vdb", capture)
+
+    embedding.embed_docs_into_vdb(
+        [
+            {
+                "id": "sa-1",
+                "name": "Revenue",
+                "label": "SqlAttribute",
+                "text": "Revenue",
+                "certified": True,
+            }
+        ],
+        None,
+        None,
+    )
+
+    assert captured["rows"][0]["metadata"]["certified"] is True
+    assert captured["rows"][0]["metadata"]["content_metadata"]["certified"] is True

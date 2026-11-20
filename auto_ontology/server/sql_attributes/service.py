@@ -317,8 +317,8 @@ def update_sql_attribute(
     that case.
 
     When *expression* is omitted, patches name/description and/or the
-    certification flag only. The certification flag carries no embedding
-    content, so a certification-only patch skips the VDB refresh.
+    certification flag only. Certification rides in the VDB metadata (used by
+    retrieval ranking), so a certification-only patch still re-embeds.
 
     The connector is resolved server-side (see
     :func:`_resolve_database_name`) — callers never need to pass one.
@@ -453,7 +453,7 @@ def update_sql_attribute(
         modified_by=modified_by,
         touch=touch,
     )
-    if name_changed or description_changed:
+    if name_changed or description_changed or certification_changed:
         _reembed_sql_attribute(attr_id, existing.get("database_name"))
 
     return get_full_sql_attribute_by_id(attr_id)

@@ -17,6 +17,7 @@ import logging
 from typing import Dict, Any
 
 from langchain_core.messages import AIMessage
+from auto_ontology.retrieval.text_to_sql.answer_context import attach_answer_notes
 from auto_ontology.retrieval.text_to_sql.base import BaseAgent
 from auto_ontology.retrieval.text_to_sql.state import AgentState
 from auto_ontology.retrieval.data_access.response_formatting import format_response
@@ -69,6 +70,11 @@ class ResponseAgent(BaseAgent):
             candidates=candidates,
             response=response_explanation,
         )
+        # Disclose what the run resolved — the governed definition, the data
+        # calendar a relative phrase became, a verified-empty explanation. It
+        # goes in the reply, not only in the prompt: the persisted message and
+        # the follow-up rewriter both read this string.
+        formatted_response = attach_answer_notes(formatted_response, path_state)
 
         # --- final dict assembly ---
         sql_columns = path_state.get("sql_columns", [])

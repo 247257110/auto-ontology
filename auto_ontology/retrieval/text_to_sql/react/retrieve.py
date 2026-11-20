@@ -62,6 +62,11 @@ from auto_ontology.dal.terms import fetch_semantic_coverage, fetch_term_table_pa
 from auto_ontology.retrieval.data_access.candidates import _get_candidates_information
 from auto_ontology.retrieval.text_to_sql.react import config
 from auto_ontology.retrieval.text_to_sql.react.context import ToolContext
+from auto_ontology.retrieval.text_to_sql.react.run_sql import connector_for
+from auto_ontology.retrieval.text_to_sql.react.semantic import (
+    format_time_anchor,
+    resolve_time_anchor,
+)
 from auto_ontology.retrieval.text_to_sql.react.siblings import sibling_lines
 from auto_ontology.semantic.constants import (
     LABEL_COLUMN_ATTRIBUTE,
@@ -817,4 +822,30 @@ def retrieve(ctx: ToolContext, query: str, kinds: list[str] | None = None) -> st
     ctx.shown_concepts.update(
         concept_id for line, _, concept_id in concept_lines if line in result
     )
+    anchor = _time_anchor(ctx)
+    if anchor:
+        result = f"{result}\n\n{anchor}"
     return result
+
+
+def _time_anchor(ctx: ToolContext) -> str:
+    """Anchor relative dates on the tables this search actually showed.
+
+    Compute it lazily, once, from the retrieved table set: at the start of an
+    episode no table is known, and a MIN/MAX probe needs a real date column.
+    """
+    if ctx.time_anchor_section:
+        return ""
+    context = getattr(ctx, "semantic_context", None)
+    if context is None:
+        return ""
+    anchor = resolve_time_anchor(
+        context, connector_for(ctx), list(ctx.seen_tables.values())
+    )
+    if anchor is None:
+        return ""
+    ctx.time_anchor = anchor.as_dict()
+    section = format_time_anchor(anchor)
+    if section:
+        ctx.time_anchor_section = section
+    return section
