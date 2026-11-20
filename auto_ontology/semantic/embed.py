@@ -216,6 +216,17 @@ def _format_sample_values(raw: Any, data_type: str | None = None) -> str:
     return f" {SAMPLE_VALUES_MARKER} " + ", ".join(values) + "."
 
 
+def _term_certified(term: dict[str, Any]) -> bool:
+    """A Term's vetted status, tolerant of the fetch shapes callers use.
+
+    An explicit ``certified`` boolean wins when present; otherwise both
+    persisted flags must be true. Missing everything means uncertified.
+    """
+    if term.get("certified") is not None:
+        return bool(term.get("certified"))
+    return bool(term.get("name_certified")) and bool(term.get("description_certified"))
+
+
 def _build_rows(
     database_name: str,
     term: dict[str, Any],
@@ -238,6 +249,8 @@ def _build_rows(
         schema_names = [s for s in (term.get("schema_names") or []) if s]
         if schema_names:
             fields["schema_names"] = schema_names
+        if _term_certified(term):
+            fields["certified"] = True
         rows.append(
             {
                 "text": text,
@@ -297,6 +310,8 @@ def _build_rows(
             fields["data_type"] = a["datatype"]
         if a.get("id"):
             fields["id"] = a["id"]
+        if a.get("certified"):
+            fields["certified"] = True
         rows.append(
             {
                 "text": text,

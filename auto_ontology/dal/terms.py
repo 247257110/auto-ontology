@@ -682,6 +682,7 @@ def fetch_all_terms_and_attributes(
             s.column_attribute.c.id,
             s.catalog_schema.c.name.label("schema_name"),
             s.column_attribute.c.datatype,
+            s.column_attribute.c.certified,
         )
         .select_from(
             s.column_attribute.join(
