@@ -6819,6 +6819,7 @@
     ],
     "sql_attributes.fetch_sql_attributes_with_sql": [
       {
+        "certified": false,
         "description": "Sum of all payment amounts.",
         "expression": "SELECT sum(amount) FROM payment",
         "id": "<sqlattr:total revenue>",
@@ -7214,6 +7215,7 @@
       ],
       [
         {
+          "certified": false,
           "column_description": null,
           "column_name": "Name",
           "datatype": "NVARCHAR(200)",
@@ -7230,6 +7232,7 @@
           "term_name": "Track"
         },
         {
+          "certified": false,
           "column_description": null,
           "column_name": "amount",
           "datatype": "numeric",
@@ -7246,6 +7249,7 @@
           "term_name": "Payment"
         },
         {
+          "certified": false,
           "column_description": null,
           "column_name": "customer_id",
           "datatype": "integer",
@@ -7262,6 +7266,7 @@
           "term_name": "Customer"
         },
         {
+          "certified": false,
           "column_description": null,
           "column_name": "email",
           "datatype": "character varying",
@@ -7278,6 +7283,7 @@
           "term_name": "Customer"
         },
         {
+          "certified": false,
           "column_description": null,
           "column_name": "film_id",
           "datatype": "integer",
@@ -7294,6 +7300,7 @@
           "term_name": "Film"
         },
         {
+          "certified": false,
           "column_description": null,
           "column_name": "rating",
           "datatype": "mpaa_rating",
@@ -7310,6 +7317,7 @@
           "term_name": "Film"
         },
         {
+          "certified": false,
           "column_description": null,
           "column_name": "rental_date",
           "datatype": "timestamp with time zone",
@@ -7326,6 +7334,7 @@
           "term_name": "Rental"
         },
         {
+          "certified": false,
           "column_description": null,
           "column_name": "title",
           "datatype": "text",
@@ -7378,6 +7387,7 @@
       ],
       [
         {
+          "certified": false,
           "column_description": null,
           "column_name": "film_id",
           "datatype": "integer",
@@ -7394,6 +7404,7 @@
           "term_name": "Film"
         },
         {
+          "certified": false,
           "column_description": null,
           "column_name": "rating",
           "datatype": "mpaa_rating",
@@ -7410,6 +7421,7 @@
           "term_name": "Film"
         },
         {
+          "certified": false,
           "column_description": null,
           "column_name": "title",
           "datatype": "text",

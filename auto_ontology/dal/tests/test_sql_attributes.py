@@ -587,6 +587,7 @@ def test_with_sql_returns_one_row_per_attribute(world) -> None:
             "expression": "sum(amount)",
             "sql": "SELECT 1",
             "term_name": f"{world.prefix}-Revenue",
+            "certified": False,
         }
     ]
 
