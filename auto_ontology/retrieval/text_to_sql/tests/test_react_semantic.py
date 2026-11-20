@@ -42,6 +42,7 @@ def _patch_search(monkeypatch, hits: list[dict[str, Any]]) -> None:
         return []
 
     monkeypatch.setattr(semantic, "search_semantic_index", fake_search)
+    monkeypatch.setattr(semantic, "list_sql_attributes", lambda: [])
     monkeypatch.setattr(
         semantic,
         "fetch_sql_attributes_with_sql",
@@ -147,9 +148,21 @@ def test_the_time_anchor_is_computed_once(monkeypatch) -> None:
     ctx.semantic_context = semantic.SemanticContext(
         ir={"time_ranges": [{"expression": "最近30天", "canonical": "rolling_30d"}]}
     )
+    from datetime import date
+
+    from auto_ontology.retrieval.text_to_sql.time_anchor import DataWindow
+
+    anchor = semantic.TimeAnchor(
+        window=DataWindow(start=date(2024, 1, 1), end=date(2026, 11, 17)),
+        resolved=[],
+    )
     monkeypatch.setattr(
-        "auto_ontology.retrieval.text_to_sql.react.retrieve.build_time_anchor",
-        lambda *a, **k: "## Time anchoring",
+        "auto_ontology.retrieval.text_to_sql.react.retrieve.resolve_time_anchor",
+        lambda *a, **k: anchor,
+    )
+    monkeypatch.setattr(
+        "auto_ontology.retrieval.text_to_sql.react.retrieve.format_time_anchor",
+        lambda _anchor: "## Time anchoring",
     )
 
     assert _time_anchor(ctx) == "## Time anchoring"
@@ -161,3 +174,34 @@ def test_a_chinese_question_asks_for_a_chinese_answer() -> None:
     assert "Simplified Chinese" in note
     assert "table names" in note
     assert semantic.answer_language_note("revenue by region") == ""
+
+
+def test_a_metric_question_is_a_calculation() -> None:
+    ir = {"metrics": ["含税营收"]}
+
+    assert semantic.is_calculation_question("查询最近12个月含税营收", ir)
+    assert not semantic.is_calculation_question("营收怎么算？", ir)
+    assert not semantic.is_calculation_question("最近12个月有多少客户", {})
+
+
+def test_name_matched_attributes_are_scoped_to_the_target_database(monkeypatch) -> None:
+    from auto_ontology.retrieval.text_to_sql.semantic_ir import build_semantic_ir
+
+    rows = [
+        {"id": "wwi", "name": "营收（含税）", "description": ""},
+        {"id": "retail", "name": "营收", "description": ""},
+    ]
+    monkeypatch.setattr(semantic, "list_sql_attributes", lambda: rows)
+    monkeypatch.setattr(
+        semantic,
+        "fetch_sql_attribute_databases",
+        lambda ids: {
+            "wwi": {"wideworldimporters"},
+            "retail": {"retail_churn"},
+        },
+    )
+    ir = build_semantic_ir("查询营收", question_type="calculation")
+
+    matched = semantic._named_sql_attributes(ir, "retail_churn")
+
+    assert [row["id"] for row in matched] == ["retail"]

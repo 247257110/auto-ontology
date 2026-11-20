@@ -62,6 +62,11 @@ stored values before filtering on them, and to test a draft.
 - submit: give your final query. It is checked and run; if it fails you get \
 the error and can keep working.
 
+A question that asks for a number, a list of rows, or a comparison is a \
+calculation: write and run SQL, and let the result be the answer. Answer in \
+words only for a catalog or definition question, and only from what retrieve \
+showed.
+
 Return exactly the requested output fields and no others.
 
 Aggregate, GROUP BY or LIMIT only when the question or its clarifications ask \

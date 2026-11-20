@@ -47,7 +47,8 @@ _EVENT_NAME_RE = re.compile(
 
 # Names whose max value is deliberately far from the data's coverage.
 _SENTINEL_NAME_RE = re.compile(
-    r"(validto|validfrom|expiry|expire|end_date|deleted|updated|modified)",
+    r"(validto|validfrom|expiry|expire|end_date|deleted|updated|modified|"
+    r"lastedited|last_edited|lastmodified|last_modified|lastupdated|last_updated)",
     re.IGNORECASE,
 )
 
@@ -112,9 +113,22 @@ def _candidate_columns(
             scored.append((rank, qualified, column_name))
 
     scored.sort(key=lambda item: (item[0], item[1], item[2]))
-    return [(qualified, column) for _rank, qualified, column in scored][
-        :_MAX_PROBE_COLUMNS
-    ]
+    if not scored:
+        return []
+    best_rank = scored[0][0]
+    if best_rank >= 2:
+        # Every candidate is an audit/sentinel column. Its max says when a row
+        # was last touched, not when the business event happened, so it cannot
+        # anchor "the last 12 months" without silently answering a different
+        # question.
+        logger.info(
+            "Time anchor: only audit/sentinel date columns among the tables; "
+            "not anchoring"
+        )
+        return []
+    return [
+        (qualified, column) for rank, qualified, column in scored if rank == best_rank
+    ][:_MAX_PROBE_COLUMNS]
 
 
 def _as_date(value: Any) -> date | None:

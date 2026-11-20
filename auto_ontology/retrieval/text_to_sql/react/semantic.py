@@ -24,7 +24,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from auto_ontology.catalog.constants import Labels
-from auto_ontology.dal.sql_attributes import fetch_sql_attributes_with_sql
+from auto_ontology.dal.sql_attributes import (
+    fetch_sql_attribute_databases,
+    fetch_sql_attributes_with_sql,
+    list_sql_attributes,
+)
 from auto_ontology.retrieval.data_access.semantic_search import search_semantic_index
 from auto_ontology.retrieval.text_to_sql.db_probe.date_window import probe_data_window
 from auto_ontology.retrieval.text_to_sql.metric_grounding import (
@@ -170,7 +174,13 @@ def _retrieve_candidates(
         # lets the ReAct agent fall back to its normal catalog search.
         raise RuntimeError("semantic search is unavailable")
 
-    sql_attributes = _with_sql_details(hits.get(LABEL_SQL_ATTRIBUTE) or [])
+    sql_hits = _dedupe(
+        [
+            *(hits.get(LABEL_SQL_ATTRIBUTE) or []),
+            *_named_sql_attributes(ir, database_name),
+        ]
+    )
+    sql_attributes = _with_sql_details(sql_hits)
     return {
         "sql_attributes": sql_attributes,
         "custom_analyses": hits.get(Labels.CUSTOM_ANALYSIS) or [],
@@ -198,6 +208,42 @@ def _dedupe(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(best.values())
 
 
+def _named_sql_attributes(
+    ir: SemanticIR, database_name: str | None
+) -> list[dict[str, Any]]:
+    """SQL Attributes whose *name* contains a Chinese metric or dimension.
+
+    Vector search is a ranking, and a certified definition can fall outside its
+    top-k when several attributes mention the same head noun. The name is the
+    strongest signal for a governed metric, so it is also matched directly.
+    Only Chinese phrases are supplemented: an English question never reaches
+    this module's grounding, and scanning every attribute for an English token
+    would add noise rather than recall.
+    """
+    phrases = [value for value in (*ir.metrics, *ir.dimensions) if value]
+    if not any(contains_cjk(value) for value in phrases):
+        return []
+    matched: list[dict[str, Any]] = []
+    for row in list_sql_attributes():
+        text = " ".join(
+            str(row.get(key) or "") for key in ("name", "description", "term_name")
+        )
+        if any(phrase in text for phrase in phrases):
+            matched.append(row)
+    if not matched or not database_name:
+        return matched
+
+    scopes = fetch_sql_attribute_databases(
+        [str(row.get("id")) for row in matched if row.get("id")]
+    )
+    target = database_name.casefold()
+    return [
+        row
+        for row in matched
+        if target in {name.casefold() for name in scopes.get(str(row.get("id")), set())}
+    ]
+
+
 def _with_sql_details(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Merge the stored formula into each search hit.
 
@@ -220,6 +266,35 @@ def _with_sql_details(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
                     row[key] = value
         merged.append(row)
     return merged
+
+
+#: Phrases that ask what a metric *means* rather than for its value. Such a
+#: question may legitimately be answered from the catalog, without SQL.
+_DEFINITION_MARKERS = (
+    "怎么算",
+    "怎么计算",
+    "如何计算",
+    "计算方式",
+    "定义",
+    "含义",
+    "什么意思",
+    "是什么",
+    "口径",
+)
+
+
+def is_calculation_question(question: str, ir: dict[str, Any] | None) -> bool:
+    """Whether a Chinese metric question asks for a computed value.
+
+    The answer to "查询最近12个月含税营收" is a number; a prose description of
+    the query is not an answer. "营收怎么算？" asks for the definition and may
+    be answered from the catalog. The IR's metric list is what makes this
+    decidable without another model call.
+    """
+    if not ir or not ir.get("metrics"):
+        return False
+    lowered = question.casefold()
+    return not any(marker in lowered for marker in _DEFINITION_MARKERS)
 
 
 def answer_language_note(question: str) -> str:
@@ -442,6 +517,7 @@ def format_metric_bindings_section(
 
 __all__ = [
     "SemanticContext",
+    "is_calculation_question",
     "TimeAnchor",
     "answer_language_note",
     "build_semantic_context",

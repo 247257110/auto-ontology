@@ -212,3 +212,57 @@ def test_a_chinese_question_gets_a_chinese_fallback(
     )
 
     assert "无法" in result["path_state"]["unconstructable_explanation"]
+
+
+def test_a_metric_question_turns_prose_answers_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contexts = []
+    monkeypatch.setattr(
+        agent_module,
+        "build_semantic_context",
+        lambda *a, **k: SemanticContext(ir={"metrics": ["营收"]}),
+    )
+
+    def episode(_llm: object, ctx: object, *_a: object, **_k: object) -> EpisodeResult:
+        contexts.append(ctx)
+        return _episode(None, "budget_exhausted")
+
+    monkeypatch.setattr(agent_module, "run_episode", episode)
+
+    agent_module.ReactSQLAgent().execute(
+        {
+            **_state(),
+            "initial_question": "查询最近12个月营收",
+            "prediction_override": False,
+        }
+    )
+
+    assert contexts[0].information_answers is False
+
+
+def test_a_definition_question_keeps_prose_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contexts = []
+    monkeypatch.setattr(
+        agent_module,
+        "build_semantic_context",
+        lambda *a, **k: SemanticContext(ir={"metrics": ["营收"]}),
+    )
+
+    def episode(_llm: object, ctx: object, *_a: object, **_k: object) -> EpisodeResult:
+        contexts.append(ctx)
+        return _episode(None, "budget_exhausted")
+
+    monkeypatch.setattr(agent_module, "run_episode", episode)
+
+    agent_module.ReactSQLAgent().execute(
+        {
+            **_state(),
+            "initial_question": "营收怎么算？",
+            "prediction_override": False,
+        }
+    )
+
+    assert contexts[0].information_answers is True

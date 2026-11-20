@@ -27,6 +27,7 @@ from auto_ontology.retrieval.text_to_sql.react.mode import (
 from auto_ontology.retrieval.text_to_sql.react.run_sql import connector_for
 from auto_ontology.retrieval.text_to_sql.react.semantic import (
     build_semantic_context,
+    is_calculation_question,
 )
 from auto_ontology.retrieval.text_to_sql.state import (
     AgentState,
@@ -115,6 +116,11 @@ class ReactSQLAgent(BaseAgent):
             path_state["semantic_ir"] = semantic.ir
             path_state["grounded_metrics"] = semantic.grounded_metrics
             ctx.semantic_context = semantic
+            if is_calculation_question(processing_question, semantic.ir):
+                # The answer is a value, not a description of the query. Without
+                # this the model can submit prose and no SQL, which the chat
+                # renders as an answer even though nothing ran.
+                ctx.information_answers = False
             if semantic.clarification:
                 path_state["metric_clarification_question"] = semantic.clarification
                 if mode is EpisodeMode.SQL:

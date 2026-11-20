@@ -377,6 +377,12 @@ def run_episode(
                 observation, answer = _dispatch(ctx, name, args, offered)
             if answer is None:
                 observation = _with_cost_status(ctx, observation)
+            logger.debug(
+                "ReAct tool %s%s -> %s",
+                name,
+                f"({args.get('query')})" if args.get("query") else "",
+                _clip(str(observation), 240),
+            )
             messages.append(
                 ToolMessage(content=observation, tool_call_id=call.get("id") or name)
             )

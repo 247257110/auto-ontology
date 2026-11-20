@@ -189,6 +189,12 @@ def _score_metric(metric: str, candidate: dict[str, Any]) -> float:
     text = _candidate_text(candidate).casefold()
     if query == name or query in name.split():
         return 1.0
+    # Chinese names do not split on spaces: "营收（含税）" is the head noun
+    # "营收" plus a caliber. A name that *starts* with the asked phrase is that
+    # metric; one that merely contains it mid-name ("品类营收与毛利率") is a
+    # different, broader definition and should not tie with it.
+    if name.startswith(query):
+        return 1.0
     if query in text:
         return 0.85
     tokens = set(re.findall(r"[a-z0-9_]+", query))

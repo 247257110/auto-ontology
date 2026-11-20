@@ -222,7 +222,8 @@ def test_only_date_columns_are_candidates() -> None:
     assert columns == [("sales.invoices", "invoicedate")]
 
 
-def test_event_timestamps_outrank_incidental_dates() -> None:
+def test_event_timestamps_exclude_incidental_dates() -> None:
+    """A row's last-touched date is not when the business event happened."""
     columns = date_window._candidate_columns(
         [
             _table(
@@ -230,17 +231,14 @@ def test_event_timestamps_outrank_incidental_dates() -> None:
                     ("birth_date", "date"),
                     ("validto", "timestamp"),
                     ("invoicedate", "date"),
+                    ("lasteditedwhen", "timestamp"),
                 ]
             )
         ],
         None,
     )
 
-    assert [column for _table_name, column in columns] == [
-        "invoicedate",
-        "birth_date",
-        "validto",
-    ]
+    assert [column for _table_name, column in columns] == ["invoicedate"]
 
 
 def test_the_probe_list_is_capped() -> None:
