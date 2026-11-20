@@ -104,6 +104,7 @@ class ReactSQLAgent(BaseAgent):
             )
             path_state["semantic_ir"] = semantic.ir
             path_state["grounded_metrics"] = semantic.grounded_metrics
+            ctx.semantic_context = semantic
             if semantic.clarification:
                 path_state["metric_clarification_question"] = semantic.clarification
                 if mode is EpisodeMode.SQL:

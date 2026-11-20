@@ -26,6 +26,7 @@ from typing import Any
 from auto_ontology.catalog.constants import Labels
 from auto_ontology.dal.sql_attributes import fetch_sql_attributes_with_sql
 from auto_ontology.retrieval.data_access.semantic_search import search_semantic_index
+from auto_ontology.retrieval.text_to_sql.db_probe.date_window import probe_data_window
 from auto_ontology.retrieval.text_to_sql.metric_grounding import (
     build_metric_clarification_question,
     ground_metric_semantics,
@@ -33,6 +34,10 @@ from auto_ontology.retrieval.text_to_sql.metric_grounding import (
 from auto_ontology.retrieval.text_to_sql.semantic_ir import (
     SemanticIR,
     build_semantic_ir,
+)
+from auto_ontology.retrieval.text_to_sql.time_anchor import (
+    format_time_anchor_section,
+    resolve_time_ranges,
 )
 from auto_ontology.semantic.chinese import contains_cjk
 from auto_ontology.semantic.constants import (
@@ -201,6 +206,32 @@ def _with_sql_details(hits: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return merged
 
 
+def build_time_anchor(
+    context: SemanticContext | None,
+    connector: Any,
+    tables: list[dict[str, Any]],
+) -> str:
+    """Resolve the question's relative time phrases on the data's calendar.
+
+    The window is probed from the live connection because the catalog stores no
+    column statistics, and the failure this prevents — ``最近12个月`` compiled
+    against a snapshot that stopped years ago, returning zero rows — reads as a
+    data-quality problem rather than a date problem. A failed probe leaves the
+    episode unanchored rather than guessing ``now()``.
+    """
+    if context is None or not context.ir or not context.ir.get("time_ranges"):
+        return ""
+    if connector is None or not tables:
+        return ""
+    try:
+        window = probe_data_window(connector, tables)
+        resolved = resolve_time_ranges(context.ir.get("time_ranges"), window)
+        return format_time_anchor_section(resolved, window)
+    except Exception:  # noqa: BLE001 - anchoring is an enhancement, not a gate
+        logger.warning("time anchoring failed", exc_info=True)
+        return ""
+
+
 def format_semantic_context(context: SemanticContext | None) -> str:
     """Render the IR and its grounding as prompt sections the agent can use."""
     if context is None or context.is_empty:
@@ -360,6 +391,7 @@ def format_metric_bindings_section(
 __all__ = [
     "SemanticContext",
     "build_semantic_context",
+    "build_time_anchor",
     "format_dimension_bindings_section",
     "format_metric_bindings_section",
     "format_metric_semantics_section",

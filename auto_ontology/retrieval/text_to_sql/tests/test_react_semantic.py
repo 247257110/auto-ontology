@@ -103,3 +103,54 @@ def test_a_failed_search_leaves_the_agent_unchanged(monkeypatch) -> None:
 def test_an_empty_context_renders_nothing() -> None:
     assert semantic.format_semantic_context(None) == ""
     assert semantic.format_semantic_context(semantic.SemanticContext()) == ""
+
+
+def test_a_relative_time_range_is_anchored_on_the_data_window(monkeypatch) -> None:
+    from datetime import date
+
+    from auto_ontology.retrieval.text_to_sql.time_anchor import DataWindow
+
+    monkeypatch.setattr(
+        semantic,
+        "probe_data_window",
+        lambda connector, tables: DataWindow(
+            start=date(2024, 1, 1),
+            end=date(2026, 11, 17),
+            source="orders.order_date",
+        ),
+    )
+    context = semantic.SemanticContext(
+        ir={
+            "time_ranges": [
+                {
+                    "expression": "最近12个月",
+                    "canonical": "rolling_12mo",
+                    "kind": "rolling",
+                    "granularity": "month",
+                }
+            ]
+        }
+    )
+
+    section = semantic.build_time_anchor(context, object(), [{"name": "orders"}])
+
+    assert "2026-11-17" in section
+    assert "order_date >=" in section
+    assert "CURRENT_DATE" in section
+
+
+def test_the_time_anchor_is_computed_once(monkeypatch) -> None:
+    from auto_ontology.retrieval.text_to_sql.react.context import ToolContext
+    from auto_ontology.retrieval.text_to_sql.react.retrieve import _time_anchor
+
+    ctx = ToolContext(None, [])
+    ctx.semantic_context = semantic.SemanticContext(
+        ir={"time_ranges": [{"expression": "最近30天", "canonical": "rolling_30d"}]}
+    )
+    monkeypatch.setattr(
+        "auto_ontology.retrieval.text_to_sql.react.retrieve.build_time_anchor",
+        lambda *a, **k: "## Time anchoring",
+    )
+
+    assert _time_anchor(ctx) == "## Time anchoring"
+    assert _time_anchor(ctx) == ""
