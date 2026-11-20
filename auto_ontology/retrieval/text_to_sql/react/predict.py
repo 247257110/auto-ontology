@@ -65,6 +65,7 @@ def _with_example_tables(
                 "id": row.get("id"),
                 "name": row.get("name"),
                 "schema_name": row.get("schema_name") or "",
+                "database_name": row.get("database_name") or "",
                 "description": row.get("description") or "",
                 "pk": row.get("pk"),
                 "label": Labels.TABLE,
@@ -72,6 +73,26 @@ def _with_example_tables(
         )
         existing.add(name.upper())
     return enriched
+
+
+def _tables_in_scope(
+    tables: list[dict[str, Any]], database_name: str | None
+) -> list[dict[str, Any]]:
+    """Drop tables a retrieve found in another database.
+
+    A prediction graph belongs to one library. A table from another connection
+    either fails to read (noise in the log) or, worse, loads a same-named table
+    with different rows and joins the features against the wrong data.
+    A table with no database name is kept: it cannot be proven foreign.
+    """
+    target = (database_name or "").casefold()
+    if not target:
+        return tables
+    return [
+        table
+        for table in tables
+        if str(table.get("database_name") or "").casefold() in ("", target)
+    ]
 
 
 def _refused(ctx: ToolContext, message: str) -> tuple[str, None]:
@@ -103,7 +124,10 @@ def predict(ctx: ToolContext) -> tuple[str, Prediction | None]:
     from auto_ontology.retrieval.kumo.rag import fetch_pql_examples
 
     examples = fetch_pql_examples(ctx.retriever, ctx.question)
-    tables = _with_example_tables(list(ctx.seen_tables.values()), examples)
+    tables = _tables_in_scope(
+        _with_example_tables(list(ctx.seen_tables.values()), examples),
+        ctx.database_name,
+    )
     connector = connector_for(ctx)
     try:
         context = build_prediction_context(

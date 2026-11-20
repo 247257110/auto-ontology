@@ -18,7 +18,11 @@ from auto_ontology.retrieval.text_to_sql.react import loop
 from auto_ontology.retrieval.text_to_sql.react.context import ToolContext
 from auto_ontology.retrieval.text_to_sql.react.loop import EpisodeResult
 from auto_ontology.retrieval.text_to_sql.react.mode import EpisodeMode, episode_mode
-from auto_ontology.retrieval.text_to_sql.react.predict import Prediction, predict
+from auto_ontology.retrieval.text_to_sql.react.predict import (
+    Prediction,
+    _tables_in_scope,
+    predict,
+)
 from auto_ontology.retrieval.text_to_sql.tests.react_fakes import ScriptedModel, call
 
 PREDICTED = {
@@ -257,3 +261,15 @@ def test_a_prediction_ends_the_pipeline_without_formatting() -> None:
     list(pipeline.run_steps({"path_state": {}, "decision": ""}, steps))
 
     assert calls == ["react_sql_agent"]
+
+
+def test_tables_from_another_database_are_dropped() -> None:
+    tables = [
+        {"name": "orders", "database_name": "retail_churn"},
+        {"name": "invoices", "database_name": "wideworldimporters"},
+        {"name": "unscoped"},
+    ]
+
+    kept = _tables_in_scope(tables, "retail_churn")
+
+    assert [table["name"] for table in kept] == ["orders", "unscoped"]
