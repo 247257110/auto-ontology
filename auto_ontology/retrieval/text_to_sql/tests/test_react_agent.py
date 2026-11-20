@@ -10,6 +10,7 @@ from auto_ontology.retrieval.text_to_sql import pipeline
 from auto_ontology.retrieval.text_to_sql.agents.sql_execution import QueryResponse
 from auto_ontology.retrieval.text_to_sql.react import agent as agent_module
 from auto_ontology.retrieval.text_to_sql.react.loop import EpisodeResult, Submission
+from auto_ontology.retrieval.text_to_sql.react.semantic import SemanticContext
 
 
 def _state() -> dict:
@@ -142,3 +143,51 @@ def test_the_pipeline_has_only_the_agent_and_its_two_outcomes() -> None:
         "format_and_respond",
         "unconstructable_sql_response",
     }
+
+
+def test_a_metric_clarification_stops_before_the_episode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clarification = "指标“营收”对应多个口径，请确认使用哪一个。"
+    monkeypatch.setattr(
+        agent_module,
+        "build_semantic_context",
+        lambda *a, **k: SemanticContext(
+            ir={"language": "zh"}, clarification=clarification
+        ),
+    )
+
+    def fail(*_a: object, **_k: object) -> EpisodeResult:
+        raise AssertionError("the episode must not run while a metric is ambiguous")
+
+    monkeypatch.setattr(agent_module, "run_episode", fail)
+
+    result = agent_module.ReactSQLAgent().execute(
+        {**_state(), "prediction_override": False}
+    )
+
+    assert result["decision"] == "unconstructable"
+    assert result["path_state"]["unconstructable_explanation"] == clarification
+    assert result["path_state"]["metric_clarification_question"] == clarification
+    assert pipeline.route_react(result) == "unconstructable_sql_response"
+
+
+def test_a_semantic_context_reaches_the_episode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = SemanticContext(ir={"language": "zh", "metrics": ["营收"]})
+    monkeypatch.setattr(agent_module, "build_semantic_context", lambda *a, **k: context)
+    calls: list[dict] = []
+
+    def episode(*_a: object, **kwargs: object) -> EpisodeResult:
+        calls.append(kwargs)
+        return _episode(None, "budget_exhausted")
+
+    monkeypatch.setattr(agent_module, "run_episode", episode)
+
+    result = agent_module.ReactSQLAgent().execute(
+        {**_state(), "prediction_override": False}
+    )
+
+    assert calls[0]["semantic_context"] is context
+    assert result["path_state"]["semantic_ir"] == context.ir
