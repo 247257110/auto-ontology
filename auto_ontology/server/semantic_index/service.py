@@ -119,9 +119,13 @@ def _rows_for_sql_attributes(
 
     rows: list[dict[str, Any]] = []
     for row in attrs:
-        database_name = database_by_id.get(row["id"])
-        if database_names is not None and database_name not in database_names:
+        attr_databases = database_by_id.get(row["id"]) or set()
+        if database_names is not None and not (attr_databases & database_names):
             continue
+        # A definition spanning several databases cannot be scoped to one in
+        # the VDB; ``None`` keeps it global, and the consistency check reports
+        # the span separately.
+        database_name = next(iter(attr_databases)) if len(attr_databases) == 1 else None
         description = row.get("description")
         text = f"sql_attribute: {row['name']}"
         if description and str(description).strip():
